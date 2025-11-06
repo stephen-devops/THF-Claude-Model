@@ -147,6 +147,9 @@ dmypy.json
 ehthumbs.db
 Thumbs.db
 
+# Windows null device file (created by some tools incorrectly handling NUL)
+nul
+
 # Application specific
 logs/
 *.log

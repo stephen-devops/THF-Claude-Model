@@ -4,6 +4,7 @@ Wazuh Security Agent using LangChain
 from langchain.agents import initialize_agent, AgentType
 from langchain.memory import ConversationSummaryBufferMemory
 from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
 from langchain.callbacks import LangChainTracer
 from langchain_anthropic import ChatAnthropic
 from typing import Dict, Any, List, Optional
@@ -15,6 +16,7 @@ from collections import defaultdict
 from functions._shared.opensearch_client import WazuhOpenSearchClient
 from tools.wazuh_tools import get_all_tools
 from .context_processor import ConversationContextProcessor
+from .query_complexity import QueryComplexityAnalyzer
 
 logger = structlog.get_logger()
 
@@ -58,9 +60,18 @@ class WazuhSecurityAgent:
         # Initialize local model if configured
         if local_model_config and local_model_config.get("enabled", False):
             try:
-                self.llm_local = ChatOllama(
+                # Use ChatOpenAI for OpenAI-compatible wrapper (not ChatOllama)
+                # ChatOpenAI automatically appends /chat/completions to base_url
+                # Our wrapper expects /api/chat, so we need base_url to be .../api
+                wrapper_url = local_model_config.get("url", "http://localhost:11434")
+                # Remove trailing slash if present
+                wrapper_url = wrapper_url.rstrip('/')
+                # Append /api so ChatOpenAI will call /api/chat/completions (but our wrapper handles /api/chat)
+
+                self.llm_local = ChatOpenAI(
                     model=local_model_config.get("model_name", "deepseek-r1:32b"),
-                    base_url=local_model_config.get("url", "http://localhost:11434"),
+                    base_url=f"{wrapper_url}/api",  # ChatOpenAI will append /chat/completions
+                    api_key="dummy-key",  # Wrapper doesn't need auth, but field is required
                     temperature=0.1,
                     timeout=local_model_config.get("timeout", 120)
                 )
@@ -89,7 +100,10 @@ class WazuhSecurityAgent:
 
         # Initialize context processor
         self.context_processor = ConversationContextProcessor()
-        
+
+        # Initialize query complexity analyzer (for routing)
+        self.complexity_analyzer = QueryComplexityAnalyzer()
+
         # Initialize callbacks
         callbacks = []
         # Only enable LangSmith tracing if properly configured
@@ -194,6 +208,97 @@ class WazuhSecurityAgent:
 
             logger.info("Agent memory updated for session", session_id=session_id)
 
+    def _route_to_model(self, user_input: str, chat_history: List = None) -> str:
+        """
+        Determine which model to use based on query complexity
+
+        Args:
+            user_input: User's query
+            chat_history: Conversation history for context
+
+        Returns:
+            Model name: "claude" or "deepseek"
+        """
+        # If hybrid mode is disabled, always use Claude
+        if not self.hybrid_mode or self.llm_local is None:
+            return "claude"
+
+        # Check for forced model override from environment
+        force_model = os.getenv("FORCE_MODEL", "none").lower()
+        if force_model in ["claude", "deepseek"]:
+            logger.info("Using forced model from environment", model=force_model)
+            return force_model
+
+        # Compute query complexity
+        complexity_result = self.complexity_analyzer.compute_complexity(
+            user_input,
+            conversation_history=chat_history
+        )
+
+        # Determine if should use local model
+        use_local = self.complexity_analyzer.should_use_local_model(
+            complexity_result,
+            threshold=self.complexity_threshold
+        )
+
+        selected_model = "deepseek" if use_local else "claude"
+
+        logger.info("Model routing decision",
+                   selected_model=selected_model,
+                   complexity_score=complexity_result['score'],
+                   complexity_class=complexity_result['classification'],
+                   threshold=self.complexity_threshold)
+
+        return selected_model
+
+    def _switch_model(self, target_model: str, session_id: str):
+        """
+        Switch active LLM and reinitialize agent
+
+        Args:
+            target_model: "claude" or "deepseek"
+            session_id: Current session ID for memory context
+        """
+        # Check if switch is needed
+        if target_model == self.current_model:
+            logger.debug("Model switch not needed", current_model=self.current_model)
+            return
+
+        # Switch LLM
+        if target_model == "deepseek" and self.llm_local:
+            self.llm = self.llm_local
+            self.current_model = "deepseek"
+            logger.info("Switched to local model", model="deepseek-r1:32b")
+        else:
+            self.llm = self.llm_claude
+            self.current_model = "claude"
+            logger.info("Switched to Claude model", model="claude-sonnet-4")
+
+        # Reinitialize agent with new LLM
+        session_memory = self._get_session_memory(session_id)
+        callbacks = []
+        try:
+            if os.getenv("LANGCHAIN_TRACING_V2") == "true" and os.getenv("LANGCHAIN_API_KEY"):
+                callbacks.append(LangChainTracer())
+        except Exception as e:
+            logger.warning("Failed to initialize LangSmith tracing", error=str(e))
+
+        self.agent = initialize_agent(
+            tools=self.tools,
+            llm=self.llm,
+            agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
+            memory=session_memory,
+            verbose=True,
+            max_iterations=5,
+            early_stopping_method="force",
+            callbacks=callbacks,
+            handle_parsing_errors=True
+        )
+
+        logger.info("Agent reinitialized with new model",
+                   model=self.current_model,
+                   session_id=session_id)
+
     async def query(self, user_input: str, session_id: str = "default") -> str:
         """
         Process user query and return response with session-based context
@@ -223,17 +328,22 @@ class WazuhSecurityAgent:
                        context_applied=context_result["context_applied"],
                        reasoning=context_result["reasoning"])
 
+            # NEW: Route to appropriate model based on query complexity
+            selected_model = self._route_to_model(user_input, chat_history)
+            self._switch_model(selected_model, session_id)
+
             # Create enriched input with context for LLM when context is applied
             enriched_input = user_input
             if context_result["context_applied"]:
                 enriched_input = self._create_context_enriched_input(user_input, context_result)
 
-            # Execute agent with context-aware input
-            response = await self._execute_with_retry(enriched_input, context_result)
+            # Execute agent with context-aware input (using routed model)
+            response = await self._execute_with_retry(enriched_input, context_result, selected_model)
 
             logger.info("Agent query completed with context",
                        query_preview=user_input[:100],
                        session_id=session_id,
+                       model_used=selected_model,
                        response_length=len(response))
 
             return response
@@ -245,17 +355,38 @@ class WazuhSecurityAgent:
                         session_id=session_id)
             return f"I encountered an error processing your request: {str(e)}"
 
-    async def _execute_with_retry(self, user_input: str, context_result: Dict[str, Any], max_retries: int = 2) -> str:
-        """Execute agent with retry logic for API overload"""
+    async def _execute_with_retry(self, user_input: str, context_result: Dict[str, Any],
+                                   selected_model: str, max_retries: int = 2) -> str:
+        """
+        Execute agent with retry logic for API overload and model fallback
+
+        Args:
+            user_input: User's query
+            context_result: Context processing result
+            selected_model: Initially selected model ("claude" or "deepseek")
+            max_retries: Maximum retry attempts
+
+        Returns:
+            Agent's response
+        """
         # Store context result for tool execution
         self._current_context_result = context_result
+        current_model = selected_model
+        attempted_fallback = False
 
         for attempt in range(max_retries + 1):
             try:
                 # Agent expects input as dict with "input" key for STRUCTURED_CHAT type
                 response = await self.agent.ainvoke({"input": user_input})
                 # Extract the output from the response dict
-                return response.get("output", str(response))
+                result = response.get("output", str(response))
+
+                logger.info("Agent execution successful",
+                           model_used=current_model,
+                           fallback_used=attempted_fallback)
+
+                return result
+
             except Exception as e:
                 error_str = str(e)
                 error_type = type(e).__name__
@@ -264,9 +395,23 @@ class WazuhSecurityAgent:
                 logger.error("Agent execution error",
                            error_type=error_type,
                            error_message=error_str,
+                           model=current_model,
                            user_input_preview=user_input[:200],
                            context_filters=context_result.get("suggested_filters", {}),
                            attempt=attempt + 1)
+
+                # NEW: Fallback to Claude if DeepSeek fails with parsing/validation errors
+                if current_model == "deepseek" and not attempted_fallback:
+                    if any(keyword in error_str.lower() for keyword in
+                           ["parsing", "validation", "json", "pydantic", "schema"]):
+                        logger.warning("DeepSeek model failed, falling back to Claude",
+                                     error_type=error_type,
+                                     error_preview=error_str[:100])
+                        # Switch to Claude and retry
+                        self._switch_model("claude", self.current_session_id)
+                        current_model = "claude"
+                        attempted_fallback = True
+                        continue
 
                 if "overloaded" in error_str.lower() or "529" in error_str:
                     if attempt < max_retries:
