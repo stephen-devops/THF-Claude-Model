@@ -3,9 +3,10 @@ Wazuh Security Agent using LangChain
 """
 from langchain.agents import initialize_agent, AgentType
 from langchain.memory import ConversationSummaryBufferMemory
+from langchain_ollama import ChatOllama
 from langchain.callbacks import LangChainTracer
 from langchain_anthropic import ChatAnthropic
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import structlog
 import os
 import asyncio
@@ -22,28 +23,59 @@ class WazuhSecurityAgent:
     LangChain-based security agent for Wazuh SIEM
     """
     
-    def __init__(self, anthropic_api_key: str, opensearch_config: Dict[str, Any]):
+    def __init__(self, anthropic_api_key: str, opensearch_config: Dict[str, Any],
+                 local_model_config: Optional[Dict[str, Any]] = None):
         """
         Initialize the Wazuh security agent
-        
+
         Args:
             anthropic_api_key: Anthropic API key
             opensearch_config: OpenSearch connection configuration
+            local_model_config: Optional local model configuration for hybrid setup
         """
         self.anthropic_api_key = anthropic_api_key
         self.opensearch_config = opensearch_config
         
         # Initialize OpenSearch client
         self.opensearch_client = WazuhOpenSearchClient(**opensearch_config)
-        
-        # Initialize LLM
-        self.llm = ChatAnthropic(
+
+        # Initialize Claude LLM (primary)
+        self.llm_claude = ChatAnthropic(
             model="claude-sonnet-4-20250514",
             temperature=0.1,
             anthropic_api_key=anthropic_api_key,
             max_tokens=3000,  # Reduced to help prevent API overload
             timeout=30  # Add timeout for overload handling
         )
+
+        # Initialize local model configuration
+        self.llm_local = None
+        self.local_model_config = local_model_config
+        self.hybrid_mode = False
+        self.complexity_threshold = 0.6
+        self.current_model = "claude"
+
+        # Initialize local model if configured
+        if local_model_config and local_model_config.get("enabled", False):
+            try:
+                self.llm_local = ChatOllama(
+                    model=local_model_config.get("model_name", "deepseek-r1:32b"),
+                    base_url=local_model_config.get("url", "http://localhost:11434"),
+                    temperature=0.1,
+                    timeout=local_model_config.get("timeout", 120)
+                )
+                self.hybrid_mode = local_model_config.get("hybrid_mode", False)
+                self.complexity_threshold = local_model_config.get("threshold", 0.6)
+                logger.info("Local model initialized",
+                           model=local_model_config.get("model_name"),
+                           url=local_model_config.get("url"),
+                           hybrid_mode=self.hybrid_mode)
+            except Exception as e:
+                logger.error("Failed to initialize local model", error=str(e))
+                logger.info("Falling back to Claude only")
+
+        # Set active LLM (default to Claude)
+        self.llm = self.llm_claude
         
         # Initialize tools
         self.tools = get_all_tools(self.opensearch_client, self)
@@ -113,7 +145,9 @@ class WazuhSecurityAgent:
         
         logger.info("Wazuh Security Agent initialized",
                    tools_count=len(self.tools),
-                   model="claude-4-sonnet")
+                   primary_model="claude-sonnet-4",
+                   local_model_available=self.llm_local is not None,
+                   hybrid_mode=self.hybrid_mode)
 
     def _create_session_memory(self):
         """Create a new memory instance for a session"""

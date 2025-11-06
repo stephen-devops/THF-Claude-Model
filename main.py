@@ -91,6 +91,14 @@ async def startup_event():
                 ),
                 "use_ssl": os.getenv("OPENSEARCH_USE_SSL", "true").lower() == "true",
                 "verify_certs": os.getenv("OPENSEARCH_VERIFY_CERTS", "false").lower() == "true"
+            },
+            local_model_config={
+                "enabled": os.getenv("LOCAL_MODEL_ENABLED", "false").lower() == "true",
+                "url": os.getenv("LOCAL_MODEL_URL", "http://localhost:11434"),
+                "model_name": os.getenv("LOCAL_MODEL_NAME", "deepseek-r1:32b"),
+                "timeout": int(os.getenv("LOCAL_MODEL_TIMEOUT", "120")),
+                "hybrid_mode": os.getenv("HYBRID_MODE", "false").lower() == "true",
+                "threshold": float(os.getenv("COMPLEXITY_THRESHOLD", "0.6"))
             }
         )
         
