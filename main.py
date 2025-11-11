@@ -99,6 +99,11 @@ async def startup_event():
                 "timeout": int(os.getenv("LOCAL_MODEL_TIMEOUT", "120")),
                 "hybrid_mode": os.getenv("HYBRID_MODE", "false").lower() == "true",
                 "threshold": float(os.getenv("COMPLEXITY_THRESHOLD", "0.6"))
+            },
+            deepseek_response_config={
+                "enabled": os.getenv("DEEPSEEK_RESPONSE_ENABLED", "true").lower() == "true",
+                "url": os.getenv("DEEPSEEK_RESPONSE_URL", "http://192.168.200.205:5964"),
+                "timeout": int(os.getenv("DEEPSEEK_RESPONSE_TIMEOUT", "120"))
             }
         )
         

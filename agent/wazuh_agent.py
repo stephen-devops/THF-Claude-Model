@@ -3,7 +3,6 @@ Wazuh Security Agent using LangChain
 """
 from langchain.agents import initialize_agent, AgentType
 from langchain.memory import ConversationSummaryBufferMemory
-from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from langchain.callbacks import LangChainTracer
 from langchain_anthropic import ChatAnthropic
@@ -17,6 +16,7 @@ from functions._shared.opensearch_client import WazuhOpenSearchClient
 from tools.wazuh_tools import get_all_tools
 from .context_processor import ConversationContextProcessor
 from .query_complexity import QueryComplexityAnalyzer
+from .response_enhancer import ThreatHuntingResponseEnhancer
 
 logger = structlog.get_logger()
 
@@ -26,7 +26,8 @@ class WazuhSecurityAgent:
     """
     
     def __init__(self, anthropic_api_key: str, opensearch_config: Dict[str, Any],
-                 local_model_config: Optional[Dict[str, Any]] = None):
+                 local_model_config: Optional[Dict[str, Any]] = None,
+                 deepseek_response_config: Optional[Dict[str, Any]] = None):
         """
         Initialize the Wazuh security agent
 
@@ -34,6 +35,7 @@ class WazuhSecurityAgent:
             anthropic_api_key: Anthropic API key
             opensearch_config: OpenSearch connection configuration
             local_model_config: Optional local model configuration for hybrid setup
+            deepseek_response_config: Optional DeepSeek-R1 config for response enhancement
         """
         self.anthropic_api_key = anthropic_api_key
         self.opensearch_config = opensearch_config
@@ -104,6 +106,9 @@ class WazuhSecurityAgent:
         # Initialize query complexity analyzer (for routing)
         self.complexity_analyzer = QueryComplexityAnalyzer()
 
+        # Initialize threat hunting response enhancer (DeepSeek-R1 for post-tool analysis)
+        self.response_enhancer = ThreatHuntingResponseEnhancer(deepseek_response_config)
+
         # Initialize callbacks
         callbacks = []
         # Only enable LangSmith tracing if properly configured
@@ -126,6 +131,10 @@ class WazuhSecurityAgent:
             callbacks=callbacks,
             handle_parsing_errors=True
         )
+
+        # CRITICAL: Force agent executor to always return intermediate steps for DeepSeek integration
+        # This modifies the agent executor's default behavior
+        self.agent.return_intermediate_steps = True
         
         # Enhanced system prompt with context preservation instructions
         self.system_prompt = """
@@ -161,7 +170,8 @@ class WazuhSecurityAgent:
                    tools_count=len(self.tools),
                    primary_model="claude-sonnet-4",
                    local_model_available=self.llm_local is not None,
-                   hybrid_mode=self.hybrid_mode)
+                   hybrid_mode=self.hybrid_mode,
+                   response_enhancement_enabled=self.response_enhancer.is_enabled())
 
     def _create_session_memory(self):
         """Create a new memory instance for a session"""
@@ -205,6 +215,9 @@ class WazuhSecurityAgent:
                 callbacks=callbacks,
                 handle_parsing_errors=True
             )
+
+            # CRITICAL: Re-enable intermediate steps after agent reinitialization for DeepSeek integration
+            self.agent.return_intermediate_steps = True
 
             logger.info("Agent memory updated for session", session_id=session_id)
 
@@ -295,6 +308,9 @@ class WazuhSecurityAgent:
             handle_parsing_errors=True
         )
 
+        # CRITICAL: Re-enable intermediate steps after agent reinitialization for DeepSeek integration
+        self.agent.return_intermediate_steps = True
+
         logger.info("Agent reinitialized with new model",
                    model=self.current_model,
                    session_id=session_id)
@@ -377,7 +393,9 @@ class WazuhSecurityAgent:
         for attempt in range(max_retries + 1):
             try:
                 # Agent expects input as dict with "input" key for STRUCTURED_CHAT type
+                # Agent executor is configured to return intermediate steps by default (set in __init__)
                 response = await self.agent.ainvoke({"input": user_input})
+
                 # Extract the output from the response dict
                 result = response.get("output", str(response))
 
@@ -385,7 +403,71 @@ class WazuhSecurityAgent:
                            model_used=current_model,
                            fallback_used=attempted_fallback)
 
-                return result
+                # NEW: Generate response with DeepSeek-R1 from raw tool results
+                # DeepSeek replaces Claude's observation layer entirely (not enhancement)
+                if self.response_enhancer.is_enabled():
+                    logger.info("Generating response with DeepSeek-R1 from raw tool results")
+
+                    # Extract intermediate steps to get RAW tool results (before Claude's observation)
+                    intermediate_steps = response.get("intermediate_steps", [])
+                    logger.info("Intermediate steps extracted",
+                               step_count=len(intermediate_steps))
+
+                    # Extract raw tool output and tool name
+                    tool_name = "general_analysis"
+                    raw_tool_output = None
+
+                    if intermediate_steps:
+                        # Get the last tool execution
+                        # intermediate_steps format: [(AgentAction, tool_output), ...]
+                        last_step = intermediate_steps[-1]
+                        if isinstance(last_step, tuple) and len(last_step) >= 2:
+                            action = last_step[0]
+                            tool_output = last_step[1]  # This is the RAW tool result
+
+                            if hasattr(action, 'tool'):
+                                tool_name = action.tool
+
+                            raw_tool_output = tool_output
+
+                    # Build context for response generation
+                    enhancement_context = {
+                        "session_id": self.current_session_id,
+                        "model_used": current_model,
+                        "tool_executions": len(intermediate_steps)
+                    }
+
+                    # If we have raw tool output, use DeepSeek to generate response
+                    if raw_tool_output is not None:
+                        try:
+                            logger.info("Using raw tool output for DeepSeek response generation",
+                                       tool=tool_name,
+                                       raw_output_size=len(str(raw_tool_output)))
+
+                            deepseek_result = await self.response_enhancer.enhance_response(
+                                user_query=user_input,
+                                raw_tool_results=str(raw_tool_output),  # RAW OpenSearch data
+                                tool_name=tool_name,
+                                context=enhancement_context
+                            )
+
+                            logger.info("DeepSeek response generation successful",
+                                       raw_data_length=len(str(raw_tool_output)),
+                                       response_length=len(deepseek_result))
+
+                            return deepseek_result
+
+                        except Exception as enhance_error:
+                            logger.error("DeepSeek response generation failed, falling back to Claude's observation",
+                                        error=str(enhance_error))
+                            return result
+                    else:
+                        # No tool was executed, return Claude's response as-is
+                        logger.debug("No tool execution detected, using Claude's response")
+                        return result
+                else:
+                    logger.debug("Response enhancement disabled, using Claude's observation")
+                    return result
 
             except Exception as e:
                 error_str = str(e)

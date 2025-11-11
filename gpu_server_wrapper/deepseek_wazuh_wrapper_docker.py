@@ -9,7 +9,6 @@ Configuration for Docker setup:
 
 from flask import Flask, request, jsonify, Response
 import requests
-import json
 import re
 import logging
 from datetime import datetime
@@ -28,149 +27,35 @@ app = Flask(__name__)
 OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL_NAME = "deepseek-r1:32b"
 
-# Wazuh Security Analyst System Prompt
-WAZUH_SYSTEM_PROMPT = """You are a Wazuh SIEM security analyst assistant using the ReAct (Reasoning and Acting) framework.
+# Threat Hunting Analysis System Prompt (Claude-inspired approach)
+THREAT_HUNTING_REPORT_PROMPT = """You are a Wazuh SIEM security analyst assistant. You help analysts investigate security incidents, analyze alerts, and understand their security posture.
 
-CRITICAL: You MUST respond in this EXACT format:
+Your role is to provide focused security analysis that adds context to the data without being overly prescriptive.
 
-Thought: [your reasoning about what to do]
-Action:
-```
-{
-  "action": "tool_name",
-  "action_input": {parameters}
-}
-```
+Key guidelines:
+- Provide actionable security insights
+- Highlight critical findings and potential threats
+- Explain technical concepts in clear terms
+- Suggest follow-up investigations when relevant
+- Focus on the most important security information
+- Trust the analyst to develop their own detailed response plans
 
-FORMATTING RULES:
-1. Start with "Thought:" followed by brief reasoning
-2. Next line: "Action:"
-3. Next line: Three backticks
-4. Next lines: JSON object with "action" (tool name) and "action_input" (parameters)
-5. Last line: Three backticks
+Response approach:
+- Keep responses concise and focused
+- Identify the key security concern or pattern in the data
+- Explain what the data indicates from a security perspective
+- Provide 2-3 specific follow-up suggestions
+- Add threat context (MITRE ATT&CK, known TTPs) where relevant
 
-DO NOT use any other format. This is the ONLY acceptable format.
+FORMATTING GUIDELINES:
+- Use **bold** for emphasising critical findings, severity levels, or entities (hosts, processes, users, files)
+- Use bullet points for clear organization
+- Use headers (##) sparingly, only when needed for longer responses
+- Keep the narrative flowing naturally without visual breaks
 
-EXAMPLE 1 - Count alerts by field:
-Thought: The user wants to count alerts grouped by rule groups over the last 24 hours. I'll use analyze_alerts with action="counting" and group_by.
-Action:
-```
-{
-  "action": "analyze_alerts",
-  "action_input": {
-    "action": "counting",
-    "group_by": "rule.groups",
-    "time_range": "24h"
-  }
-}
-```
-
-EXAMPLE 2 - Count alerts by host:
-Thought: The user wants to count alerts by host. I'll use action="counting" with group_by="host.name".
-Action:
-```
-{
-  "action": "analyze_alerts",
-  "action_input": {
-    "action": "counting",
-    "group_by": "host.name",
-    "time_range": "4h"
-  }
-}
-```
-
-EXAMPLE 3 - Filter critical alerts:
-Thought: The user wants to see only critical alerts. I'll use action="filtering" with level filter.
-Action:
-```
-{
-  "action": "analyze_alerts",
-  "action_input": {
-    "action": "filtering",
-    "filters": {
-      "rule.level": {"gte": 12}
-    },
-    "time_range": "24h"
-  }
-}
-```
-
-EXAMPLE 4 - Rank top alerts:
-Thought: The user wants to see the most frequent alerts. I'll use action="ranking".
-Action:
-```
-{
-  "action": "analyze_alerts",
-  "action_input": {
-    "action": "ranking",
-    "group_by": "rule.description",
-    "limit": 10,
-    "time_range": "7d"
-  }
-}
-```
-
-AVAILABLE TOOLS:
-You have access to specialized Wazuh security analysis tools that query real OpenSearch data:
-
-1. analyze_alerts - Use this to:
-   - Count alerts
-   - Filter alerts by various criteria
-   - Rank alerts by frequency
-   - Get alert distribution statistics
-
-2. investigate_entity - Use this to:
-   - Investigate specific hosts, users, processes, files, or IPs
-   - Get detailed information about entities
-   - Retrieve alerts for specific entities
-
-3. detect_threats - Use this to:
-   - Find MITRE ATT&CK techniques
-   - Identify threat actors
-   - Search for indicators of compromise (IoCs)
-
-4. map_relationships - Use this to:
-   - Map relationships between entities
-   - Correlate activities across hosts/users
-
-5. find_anomalies - Use this to:
-   - Detect threshold anomalies
-   - Find behavioral anomalies
-   - Identify trend deviations
-
-6. trace_timeline - Use this to:
-   - Reconstruct event timelines
-   - Track attack progression
-
-7. check_vulnerabilities - Use this to:
-   - Check for specific CVEs
-   - Assess vulnerability status
-
-8. monitor_agents - Use this to:
-   - Check agent status
-   - Monitor agent health
-
-EXAMPLES OF CORRECT TOOL USAGE:
-
-User: "Count alerts by rule group for the last 24 hours"
-Your Response:
-Action: analyze_alerts
-Action Input: {"action": "count_by_field", "field": "rule.groups", "time_range": "24h"}
-
-User: "Show me critical alerts from yesterday"
-Your Response:
-Action: analyze_alerts
-Action Input: {"action": "filter_alerts", "filters": {"rule.level": {"gte": 12}}, "time_range": "24h"}
-
-User: "Investigate host win10-01"
-Your Response:
-Action: investigate_entity
-Action Input: {"entity_type": "host", "entity_value": "win10-01", "action": "get_details"}
-
-NEVER respond with generic advice like "Use Splunk" or "Run this SQL query".
-Always use the actual Wazuh tools to get real data.
-
-When you receive tool results (starting with "Observation:"), analyze them and provide security insights to the user.
+OUTPUT EXPECTATION:
+Provide clear, focused security analysis that helps analysts understand what the data means and what areas to investigate further.
+Write in clear, professional prose that analysts can read and act on quickly.
 """
 
 def parse_deepseek_response(raw_response: str) -> dict:
@@ -226,10 +111,10 @@ def chat():
         if not messages:
             return jsonify({'error': 'No messages provided'}), 400
 
-        # Inject system prompt if not present or override existing
+        # Inject threat hunting report system prompt
         system_message = {
             'role': 'system',
-            'content': WAZUH_SYSTEM_PROMPT
+            'content': THREAT_HUNTING_REPORT_PROMPT
         }
 
         # Remove any existing system messages and prepend ours
@@ -241,14 +126,20 @@ def chat():
         if user_messages:
             logger.info(f"Latest message: {user_messages[-1].get('content', '')[:100]}")
 
-        # Prepare Ollama request
+        # Prepare Ollama request with AGGRESSIVE optimization for production speed (10-30s target)
         ollama_payload = {
             'model': MODEL_NAME,
             'messages': full_messages,
             'stream': False,
             'options': {
-                'temperature': 0.1,
-                'num_predict': 3000,
+                'temperature': 0.2,       # Lower for faster, more deterministic responses
+                'num_predict': 800,       # Reduced from 1500 - target 400-600 word responses
+                'top_p': 0.85,            # Tighter nucleus sampling for speed
+                'top_k': 30,              # More restricted vocabulary for faster token selection
+                'repeat_penalty': 1.15,   # Stronger penalty to avoid repetitive tokens
+                'num_ctx': 2048,          # Reduced context window - faster attention computation
+                'num_thread': 8,          # CPU threads for model operations
+                'num_gpu': 1,             # Use single GPU (adjust if using multiple)
             }
         }
 
@@ -334,9 +225,9 @@ def generate():
         data = request.get_json()
         prompt = data.get('prompt', '')
 
-        # Convert to chat format
+        # Convert to chat format with threat hunting prompt
         messages = [
-            {'role': 'system', 'content': WAZUH_SYSTEM_PROMPT},
+            {'role': 'system', 'content': THREAT_HUNTING_REPORT_PROMPT},
             {'role': 'user', 'content': prompt}
         ]
 
@@ -394,12 +285,15 @@ def tags():
 def root():
     """Root endpoint with info"""
     return jsonify({
-        'service': 'DeepSeek-R1 Wazuh Wrapper (Docker)',
+        'service': 'DeepSeek-R1 Threat Hunting Report Generator (Docker)',
         'model': MODEL_NAME,
         'ollama_url': OLLAMA_URL,
-        'description': 'OpenAI-compatible API wrapper for DeepSeek-R1 with Wazuh security analyst prompting',
+        'purpose': 'Post-tool execution response generation for Wazuh SIEM',
+        'description': 'Analyzes OpenSearch query results and generates comprehensive threat hunting reports',
+        'usage': 'Used by wazuh_agent.py after tool execution for enhanced response generation',
         'endpoints': {
             '/api/chat': 'OpenAI-compatible chat endpoint',
+            '/api/chat/completions': 'OpenAI-compatible completions endpoint',
             '/api/generate': 'Ollama-compatible generate endpoint',
             '/health': 'Health check',
             '/api/tags': 'List available models'
@@ -408,16 +302,21 @@ def root():
     })
 
 if __name__ == '__main__':
-    logger.info("=" * 60)
-    logger.info("Starting DeepSeek-R1 Wazuh Wrapper (Docker Version)")
+    logger.info("=" * 80)
+    logger.info("Starting DeepSeek-R1 Threat Hunting Report Generator (Docker Version)")
     logger.info(f"Model: {MODEL_NAME}")
     logger.info(f"Ollama URL: {OLLAMA_URL}")
     logger.info("Listening on: 0.0.0.0:5964")
-    logger.info("=" * 60)
+    logger.info("=" * 80)
+    logger.info("PURPOSE: Post-tool execution response generation")
+    logger.info("         - Analyzes OpenSearch query results")
+    logger.info("         - Generates threat hunting reports")
+    logger.info("         - Provides security context and recommendations")
+    logger.info("=" * 80)
     logger.info("NOTE: Running inside Docker container")
     logger.info("      Using existing port 5964 mapping")
     logger.info("      Connecting to Ollama on localhost:11434")
-    logger.info("=" * 60)
+    logger.info("=" * 80)
 
     app.run(
         host='0.0.0.0',
