@@ -1,0 +1,196 @@
+Mistral Large 2 - Quantised Models 
+
+legraphista/Mistral-Large-Instruct-2407-IMat-GGUF
+Text Generation
+•
+123B
+•
+Updated Jul 25, 2024
+•
+739
+•
+29
+bartowski/Mistral-Large-Instruct-2407-GGUF
+Text Generation
+•
+123B
+•
+Updated Aug 27, 2024
+•
+1.52k
+•
+35
+MaziyarPanahi/Mistral-Large-Instruct-2407-GGUF
+Text Generation
+•
+123B
+•
+Updated Jul 26, 2024
+•
+1.63k
+•
+21
+DevQuasar/Mistral-Large-Instruct-2407-GGUF
+Text Generation
+•
+123B
+•
+Updated Dec 4, 2024
+•
+34
+•
+1
+mradermacher/Mistral-Large-Instruct-2407-GGUF
+123B
+•
+Updated Jul 26
+•
+39
+•
+13
+InferenceIllusionist/Mistral-Large-Instruct-2407-iMat-GGUF
+123B
+•
+Updated Aug 4, 2024
+•
+477
+•
+3
+mradermacher/Mistral-Large-Instruct-2407-i1-GGUF
+123B
+•
+Updated Jul 26
+•
+182
+•
+10
+lmstudio-community/Mistral-Large-Instruct-2407-GGUF
+Text Generation
+•
+123B
+•
+Updated Aug 29, 2024
+•
+176
+•
+13
+second-state/Mistral-Large-Instruct-2407-GGUF
+Text Generation
+•
+123B
+•
+Updated Aug 6, 2024
+•
+408
+gaianet/Mistral-Large-Instruct-2407-GGUF
+123B
+•
+Updated Jan 31
+•
+268
+TNT3530/Mistral-Large-Instruct-2407-q4f16_1-MLC
+Updated Dec 31, 2024
+DBMe/magnum-v2-123b-2.85bpw-h6-exl2
+Text Generation
+•
+Updated Oct 21, 2024
+•
+7
+VPTQ-community/Mistral-Large-Instruct-2407-v8-k65536-0-woft
+9B
+•
+Updated Feb 25
+•
+7
+VPTQ-community/Mistral-Large-Instruct-2407-v16-k65536-16384-woft
+9B
+•
+Updated Feb 25
+•
+7
+•
+2
+VPTQ-community/Mistral-Large-Instruct-2407-v8-k65536-256-woft
+13B
+•
+Updated Feb 25
+•
+7
+VPTQ-community/Mistral-Large-Instruct-2407-v16-k65536-65536-woft
+10B
+•
+Updated Feb 25
+•
+11
+•
+1
+VPTQ-community/Mistral-Large-Instruct-2407-v8-k65536-65536-woft
+17B
+•
+Updated Feb 26
+•
+8
+•
+2
+VPTQ-community/Mistral-Large-Instruct-2407-v16-k65536-1024-woft
+8B
+•
+Updated Feb 25
+•
+8
+VPTQ-community/Mistral-Large-Instruct-2407-v16-k65536-4096-woft
+8B
+•
+Updated Feb 26
+•
+6
+xmadai/Mistral-Large-Instruct-2407-xMADai-INT4
+Text Generation
+•
+17B
+•
+Updated Oct 30, 2024
+•
+68
+•
+7
+MLDataScientist/Mistral-Large-Instruct-2407-GPTQ-3bit
+Text Generation
+•
+13B
+•
+Updated Jan 18
+•
+7
+•
+1
+MikeRoz/Mistral-Large-Instruct-2407-exl3
+Updated Apr 17
+•
+26
+•
+2
+TheDrummer/Behemoth-ReduX-123B-v1-GGUF
+123B
+•
+Updated Sep 9
+•
+41
+•
+3
+TheDrummer/Behemoth-ReduX-123B-v1.1-GGUF
+123B
+•
+Updated Oct 9
+•
+522
+•
+3
+hell0ks/Mistral-Large-Instruct-2407-AutoRound-GPTQ-4bit
+Text Generation
+•
+0.8B
+•
+Updated Nov 7
+•
+9

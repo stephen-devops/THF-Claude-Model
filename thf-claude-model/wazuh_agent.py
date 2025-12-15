@@ -1,12 +1,13 @@
 """
 Wazuh Security Agent using LangChain
 """
-from langchain.agents import initialize_agent, AgentType
-from langchain.memory import ConversationBufferWindowMemory
+from langchain.agents import AgentExecutor
+from langchain.agents.structured_chat.base import create_structured_chat_agent
+from langchain.memory import ConversationSummaryBufferMemory
 from langchain.callbacks import LangChainTracer
 from langchain_anthropic import ChatAnthropic
-from langchain_openai import ChatOpenAI
-from typing import Dict, Any, List, Optional
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from typing import Dict, Any, List
 import structlog
 import os
 import asyncio
@@ -23,59 +24,28 @@ class WazuhSecurityAgent:
     LangChain-based security agent for Wazuh SIEM
     """
     
-    def __init__(self, anthropic_api_key: Optional[str] = None, opensearch_config: Dict[str, Any] = None):
+    def __init__(self, anthropic_api_key: str, opensearch_config: Dict[str, Any]):
         """
         Initialize the Wazuh security agent
-
+        
         Args:
-            anthropic_api_key: Anthropic API key (optional if using local model)
+            anthropic_api_key: Anthropic API key
             opensearch_config: OpenSearch connection configuration
         """
         self.anthropic_api_key = anthropic_api_key
         self.opensearch_config = opensearch_config
-
+        
         # Initialize OpenSearch client
         self.opensearch_client = WazuhOpenSearchClient(**opensearch_config)
-
-        # Check if local model is enabled
-        local_model_enabled = os.getenv("LOCAL_MODEL_ENABLED", "false").lower() == "true"
-
-        # Initialize LLM based on configuration
-        if local_model_enabled:
-            # Use local model
-            local_model_url = os.getenv("LOCAL_MODEL_URL", "http://192.168.200.205:5964")
-            local_model_name = os.getenv("LOCAL_MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct-AWQ")
-            local_model_timeout = int(os.getenv("LOCAL_MODEL_TIMEOUT", "300"))
-
-            logger.info("Initializing with local model",
-                       model_name=local_model_name,
-                       model_url=local_model_url)
-
-            self.llm = ChatOpenAI(
-                model=local_model_name,
-                openai_api_base=f"{local_model_url}/v1",  # vLLM uses /v1 endpoint
-                openai_api_key="not-needed",  # vLLM doesn't require API key
-                temperature=0.1,
-                max_tokens=3000,  # 16K context: 5.5K tools + 3K previous + 3K response + buffer
-                timeout=local_model_timeout,
-                tiktoken_model_name=None  # Disable tiktoken for non-OpenAI models
-            )
-            self.model_type = "local"
-        else:
-            # Use Claude
-            if not anthropic_api_key:
-                raise ValueError("anthropic_api_key required when LOCAL_MODEL_ENABLED is false")
-
-            logger.info("Initializing with Claude Sonnet 4.5")
-
-            self.llm = ChatAnthropic(
-                model="claude-sonnet-4-20250514",
-                temperature=0.1,
-                anthropic_api_key=anthropic_api_key,
-                max_tokens=3000,
-                timeout=30
-            )
-            self.model_type = "claude"
+        
+        # Initialize LLM
+        self.llm = ChatAnthropic(
+            model="claude-sonnet-4-20250514",
+            temperature=0.1,
+            anthropic_api_key=anthropic_api_key,
+            max_tokens=3000,  # Reduced to help prevent API overload
+            timeout=300  # Add timeout for overload handling
+        )
         
         # Initialize tools
         self.tools = get_all_tools(self.opensearch_client, self)
@@ -89,16 +59,6 @@ class WazuhSecurityAgent:
 
         # Initialize context processor
         self.context_processor = ConversationContextProcessor()
-        
-        # Initialize callbacks
-        callbacks = []
-        # Only enable LangSmith tracing if properly configured
-        try:
-            if os.getenv("LANGCHAIN_TRACING_V2") == "true" and os.getenv("LANGCHAIN_API_KEY"):
-                callbacks.append(LangChainTracer())
-                logger.info("LangSmith tracing enabled")
-        except Exception as e:
-            logger.warning("Failed to initialize LangSmith tracing", error=str(e))
         
         # Enhanced system prompt with context preservation instructions
         self.system_prompt = """You are a Wazuh SIEM security analyst assistant. You help users investigate security incidents, analyze alerts, and understand their security posture.
@@ -157,34 +117,90 @@ When presenting anomaly detection results, you MUST explicitly state threshold s
 
 Technical note: When context hints from previous input query like "these alerts", "this host", "this command, these processes", etc appear, consider using previous input parameters to maintain query continuity."""
 
-        # Initialize agent with system prompt
-        self.agent = initialize_agent(
-            tools=self.tools,
+        # Initialize callbacks
+        callbacks = []
+        # Only enable LangSmith tracing if properly configured
+        try:
+            if os.getenv("LANGCHAIN_TRACING_V2") == "true" and os.getenv("LANGCHAIN_API_KEY"):
+                callbacks.append(LangChainTracer())
+                logger.info("LangSmith tracing enabled")
+        except Exception as e:
+            logger.warning("Failed to initialize LangSmith tracing", error=str(e))
+
+        # Create prompt template for structured chat agent
+        # The system prompt needs to include tool information
+        system_message = f"""{self.system_prompt}
+
+You have access to the following tools:
+
+{{tools}}
+
+Use a json blob to specify a tool by providing an action key (tool name) and an action_input key (tool input).
+
+Valid "action" values: "Final Answer" or {{tool_names}}
+
+Provide only ONE action per $JSON_BLOB, as shown:
+
+```
+{{{{
+  "action": $TOOL_NAME,
+  "action_input": $INPUT
+}}}}
+```
+
+Follow this format:
+
+Question: input question to answer
+Thought: consider previous and subsequent steps
+Action:
+```
+$JSON_BLOB
+```
+Observation: action result
+... (repeat Thought/Action/Observation N times)
+Thought: I know what to respond
+Action:
+```
+{{{{
+  "action": "Final Answer",
+  "action_input": "Final response to human"
+}}}}
+```"""
+
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_message),
+            MessagesPlaceholder(variable_name="chat_history", optional=True),
+            ("human", "{input}\n\n{agent_scratchpad}"),
+        ])
+
+        # Create the structured chat agent
+        agent = create_structured_chat_agent(
             llm=self.llm,
-            agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
+            tools=self.tools,
+            prompt=prompt
+        )
+
+        # Create agent executor
+        self.agent = AgentExecutor(
+            agent=agent,
+            tools=self.tools,
             memory=self.memory,
             verbose=True,
-            max_iterations=15,
-            early_stopping_method="generate",  # Generate response instead of force stopping
             callbacks=callbacks,
             handle_parsing_errors=True,
-            agent_kwargs={
-                "system_message": self.system_prompt,
-                "prefix": self.system_prompt
-            }
+            max_iterations=15  # Allow more iterations for complex threat hunting queries
         )
         
         logger.info("Wazuh Security Agent initialized",
                    tools_count=len(self.tools),
-                   model_type=self.model_type,
-                   model=local_model_name if local_model_enabled else "claude-sonnet-4-20250514")
+                   model="claude-4-sonnet")
 
     def _create_session_memory(self):
         """Create a new memory instance for a session"""
-        # Use ConversationBufferWindowMemory - stores last k conversation turns
-        # No token counting needed, compatible with all models
-        return ConversationBufferWindowMemory(
-            k=5,  # Keep last 5 conversation turns
+        # Use ConversationSummaryBufferMemory for better context management
+        return ConversationSummaryBufferMemory(
+            llm=self.llm,
+            max_token_limit=1500,  # Reduced to prevent API overload
             memory_key="chat_history",
             return_messages=True,
             output_key="output"
@@ -210,20 +226,68 @@ Technical note: When context hints from previous input query like "these alerts"
             except Exception as e:
                 logger.warning("Failed to initialize LangSmith tracing", error=str(e))
 
-            self.agent = initialize_agent(
-                tools=self.tools,
+            # Create prompt template for structured chat agent
+            # The system prompt needs to include tool information
+            system_message = f"""{self.system_prompt}
+
+You have access to the following tools:
+
+{{tools}}
+
+Use a json blob to specify a tool by providing an action key (tool name) and an action_input key (tool input).
+
+Valid "action" values: "Final Answer" or {{tool_names}}
+
+Provide only ONE action per $JSON_BLOB, as shown:
+
+```
+{{{{
+  "action": $TOOL_NAME,
+  "action_input": $INPUT
+}}}}
+```
+
+Follow this format:
+
+Question: input question to answer
+Thought: consider previous and subsequent steps
+Action:
+```
+$JSON_BLOB
+```
+Observation: action result
+... (repeat Thought/Action/Observation N times)
+Thought: I know what to respond
+Action:
+```
+{{{{
+  "action": "Final Answer",
+  "action_input": "Final response to human"
+}}}}
+```"""
+
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", system_message),
+                MessagesPlaceholder(variable_name="chat_history", optional=True),
+                ("human", "{input}\n\n{agent_scratchpad}"),
+            ])
+
+            # Create the structured chat agent
+            agent = create_structured_chat_agent(
                 llm=self.llm,
-                agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
+                tools=self.tools,
+                prompt=prompt
+            )
+
+            # Create agent executor with session-specific memory
+            self.agent = AgentExecutor(
+                agent=agent,
+                tools=self.tools,
                 memory=session_memory,
                 verbose=True,
-                max_iterations=15,
-                early_stopping_method="generate",  # Match main agent initialization
                 callbacks=callbacks,
                 handle_parsing_errors=True,
-                agent_kwargs={
-                    "system_message": self.system_prompt,
-                    "prefix": self.system_prompt
-                }
+                max_iterations=15  # Allow more iterations for complex threat hunting queries
             )
 
             logger.info("Agent memory updated for session", session_id=session_id)
@@ -453,25 +517,17 @@ Technical note: When context hints from previous input query like "these alerts"
     def get_system_info(self) -> Dict[str, Any]:
         """
         Get system information
-
+        
         Returns:
             Dictionary with system information
         """
-        # Determine model info
-        if self.model_type == "local":
-            model_name = os.getenv("LOCAL_MODEL_NAME", "mistral-large:123b-instruct-2407-q4_0")
-            model_info = f"Local Model: {model_name}"
-        else:
-            model_info = "claude-sonnet-4-20250514"
-
         return {
-            "model": model_info,
-            "model_type": self.model_type,
+            "model": "claude-4-sonnet",
             "tools_available": len(self.tools),
             "tool_names": [tool.name for tool in self.tools],
             "opensearch_host": self.opensearch_config.get("host"),
             "opensearch_port": self.opensearch_config.get("port"),
-            "memory_type": "ConversationBufferWindowMemory (Session-based, k=5, no summarization)",
+            "memory_type": "ConversationSummaryBufferMemory (Session-based)",
             "active_sessions": len(self.session_memories),
             "agent_type": "Structured Chat Zero Shot React Description"
         }

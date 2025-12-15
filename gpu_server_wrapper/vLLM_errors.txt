@@ -1,0 +1,18 @@
+vLLM exposing an LLM
+
+ The Reality:
+
+  Mistral 7B (7 billion parameters) is too small for complex function calling/tool use required by your Wazuh agent. It works for simple text generation but struggles with:        
+  - Structured JSON generation
+  - Multi-step ReAct reasoning
+  - OpenSearch DSL query syntax
+  - Following tool schemas precisely
+
+  Your original Mistral Large 2 (123B) would handle this perfectly but doesn't fit in 4x 40GB A100s.
+
+Your Options:
+
+  1. Stick with Claude Sonnet 4.5 (works perfectly, costs money)
+  2. Try a quantized Mistral Large (4-bit or 8-bit - would fit in memory)
+  3. Try Mistral-Nemo-12B or similar (middle ground between 7B and 123B)
+  4. Accept Mistral 7B limitations and manually handle errors

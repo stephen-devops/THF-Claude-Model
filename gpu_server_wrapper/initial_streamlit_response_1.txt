@@ -1,0 +1,54 @@
+Over the past 12 hours, host U209-PC-BLEE has generated a total of 410 alerts. The severity breakdown is as follows: - Critical: 31 alerts - High: 11 alerts - Medium: 107 alerts - Low: 261 alerts
+
+The top rules triggering alerts are:
+
+    Rule 60106: 206 alerts
+    Rule 750: 43 alerts
+    Rule 594: 40 alerts
+    Rule 60642: 29 alerts
+    Rule 92213: 26 alerts
+
+The hourly distribution of alerts is:
+
+    02:00: 136 alerts
+    03:00: 19 alerts
+    04:00: 14 alerts
+    05:00: 15 alerts
+    06:00: 11 alerts
+    07:00: 23 alerts
+    08:00: 23 alerts
+    09:00: 25 alerts
+    10:00: 24 alerts
+    11:00: 44 alerts
+    12:00: 24 alerts
+    13:00: 52 alerts
+
+The top processes involved are:
+
+    net.exe: 13 alerts
+    net1.exe: 13 alerts
+    Cmd.Exe: 1 alert
+    PowerShell.EXE: 1 alert
+    SeCEdit: 1 alert
+
+The top users involved are:
+
+    NT AUTHORITY\SYSTEM: 31 alerts
+    U209-PC-BLEE\blee: 26 alerts
+
+The integrity level breakdown is:
+
+    System: 29 alerts
+
+The top MITRE ATT&CK techniques detected are:
+
+    T1078: 206 alerts
+    T1112: 90 alerts
+    T1565.001: 83 alerts
+    T1105: 28 alerts
+    T1087: 22 alerts
+    T1092: 9 alerts
+    T1070.004: 4 alerts
+    T1078.001: 4 alerts
+    T1485: 4 alerts
+    T1059.001: 1 alert
