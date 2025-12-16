@@ -84,7 +84,7 @@ async def execute(opensearch_client, params: Dict[str, Any]) -> Dict[str, Any]:
 
         # Combine total alerts
         total_alerts = total_alerts_outbound + total_alerts_inbound
-        
+
         # Process relationship network from aggregations
         relationships = []
         relationship_summary = {
@@ -137,7 +137,7 @@ async def execute(opensearch_client, params: Dict[str, Any]) -> Dict[str, Any]:
             "inbound": inbound_aggregations
         }
         analysis = _analyze_aggregated_relationships(relationships, combined_aggregations)
-        
+
         # Build result
         result = {
             "relationship_type": "entity_to_entity",
@@ -154,17 +154,60 @@ async def execute(opensearch_client, params: Dict[str, Any]) -> Dict[str, Any]:
             "analysis": analysis,
             "recommendations": _generate_aggregated_recommendations(relationships, analysis)
         }
-        
-        logger.info("Aggregated entity-to-entity relationship mapping completed", 
+
+        logger.info("Aggregated entity-to-entity relationship mapping completed",
                    total_relationships=len(relationships),
                    unique_targets=len(relationship_summary["unique_targets"]),
                    total_connections=relationship_summary["total_connections"])
-        
+
         return result
-        
+
     except Exception as e:
         logger.error("Aggregated entity-to-entity relationship mapping failed", error=str(e))
         raise Exception(f"Failed to map entity relationships: {str(e)}")
+
+
+def _get_flexible_aggregation_terms(source_type: str, target_type: Optional[str]) -> Dict[str, Any]:
+    """
+    Get flexible aggregation terms that handle multiple process field types
+
+    For process-to-process queries, Event ID 8 (injection) uses sourceImage,
+    while Event ID 1 (process create) uses image. This function returns
+    aggregation terms that coalesce these fields.
+
+    Args:
+        source_type: Source entity type
+        target_type: Target entity type
+
+    Returns:
+        Dict with either standard "field" or script-based "script" aggregation
+    """
+    if source_type.lower() == "process" and target_type and target_type.lower() == "process":
+        # Use script to coalesce process fields: prefer image, fallback to sourceImage
+        # This captures both Event ID 1 (image) and Event ID 8 (sourceImage)
+        return {
+            "script": {
+                "source": """
+                    if (doc.containsKey('data.win.eventdata.image.keyword') &&
+                        doc['data.win.eventdata.image.keyword'].size() > 0) {
+                        return doc['data.win.eventdata.image.keyword'].value;
+                    } else if (doc.containsKey('data.win.eventdata.sourceImage.keyword') &&
+                               doc['data.win.eventdata.sourceImage.keyword'].size() > 0) {
+                        return doc['data.win.eventdata.sourceImage.keyword'].value;
+                    } else {
+                        return 'unknown';
+                    }
+                """,
+                "lang": "painless"
+            },
+            "size": 100
+        }
+    else:
+        # Standard field-based aggregation for other entity types
+        return {
+            "field": _get_entity_field(source_type),
+            "size": 100
+        }
 
 
 def _build_relationship_aggregation_query(source_type: str, source_id: Optional[str], target_type: Optional[str], time_filter: Dict[str, Any], filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -198,10 +241,36 @@ def _build_relationship_aggregation_query(source_type: str, source_id: Optional[
                 }
             })
 
+    # Add exists filter for the entity field we're aggregating on
+    # For process-to-process queries, we need to be flexible to capture all process events:
+    # - Event ID 1 (Process Create): has "image" and "parentImage"
+    # - Event ID 8 (CreateRemoteThread/Injection): has "sourceImage" and "targetImage" (NO "image")
+    # - Event ID 10 (Process Access): has "sourceImage" and "targetImage"
+    # Solution: For process queries, accept events with ANY process field
+    entity_field = _get_entity_field(source_type)
+
+    if source_type.lower() == "process" and target_type and target_type.lower() == "process":
+        # Process-to-process: accept events with ANY process-related field
+        # This captures Event ID 8 (sourceImage/targetImage), Event ID 1 (image/parentImage), etc.
+        field_exists_filter = {
+            "bool": {
+                "should": [
+                    {"exists": {"field": "data.win.eventdata.image"}},           # Event ID 1 (main process)
+                    {"exists": {"field": "data.win.eventdata.sourceImage"}},     # Event ID 8, 10 (injector/accessor)
+                    {"exists": {"field": "data.win.eventdata.targetImage"}},     # Event ID 8, 10 (victim/target)
+                    {"exists": {"field": "data.win.eventdata.parentImage"}}      # Event ID 1 (parent process)
+                ],
+                "minimum_should_match": 1
+            }
+        }
+    else:
+        # Other entity types: use standard exists filter
+        field_exists_filter = {"exists": {"field": entity_field}}
+
     query = {
         "query": {
             "bool": {
-                "must": [time_filter] + source_filters + additional_filters
+                "must": [time_filter, field_exists_filter] + source_filters + additional_filters
             }
         },
         "aggs": {
@@ -211,10 +280,9 @@ def _build_relationship_aggregation_query(source_type: str, source_id: Optional[
                 }
             },
             "source_entities": {
-                "terms": {
-                    "field": _get_entity_field(source_type),
-                    "size": 100
-                },
+                # For process-to-process: use script to coalesce process fields
+                # This handles Event ID 8 (sourceImage) and Event ID 1 (image)
+                "terms": _get_flexible_aggregation_terms(source_type, target_type),
                 "aggs": {
                     # Multiple user aggregations to capture different event types
                     "connected_users_auth": {
@@ -259,6 +327,13 @@ def _build_relationship_aggregation_query(source_type: str, source_id: Optional[
                         },
                         "aggs": _get_connection_sub_aggregations()
                     },
+                    "connected_processes_source": {
+                        "terms": {
+                            "field": "data.win.eventdata.sourceImage",  # Source processes (injectors, accessors)
+                            "size": 30
+                        },
+                        "aggs": _get_connection_sub_aggregations()
+                    },
                     "connected_files": {
                         "terms": {
                             "field": "data.win.eventdata.targetFilename",
@@ -277,7 +352,7 @@ def _build_relationship_aggregation_query(source_type: str, source_id: Optional[
             }
         }
     }
-    
+
     return query
 
 
@@ -308,6 +383,7 @@ def _process_aggregation_buckets(
         "connected_hosts": "host",
         "connected_processes": "process",           # Child processes (image)
         "connected_processes_parent": "process",    # Parent processes (parentImage)
+        "connected_processes_source": "process",    # Source processes (injectors, accessors)
         "connected_files": "file",                  # File operations (targetFilename)
         "connected_files_loaded": "file"            # DLL/Image loads (imageLoaded)
     }
@@ -460,11 +536,33 @@ def _build_reverse_relationship_aggregation_query(
     # Build entity-specific aggregations based on source_type
     entity_aggregations = _get_reverse_entity_aggregations(source_type)
 
+    # Add exists filter for the field we're aggregating on
+    # For process-to-process queries (inbound), we need the same flexibility as outbound
+    # to capture Event ID 8 (sourceImage/targetImage) and other process events
+    reverse_field = _get_reverse_aggregation_field(source_type)
+
+    if source_type.lower() == "process" and target_type and target_type.lower() == "process":
+        # Process-to-process (inbound): accept events with ANY process-related field
+        reverse_field_exists_filter = {
+            "bool": {
+                "should": [
+                    {"exists": {"field": "data.win.eventdata.image"}},           # Event ID 1
+                    {"exists": {"field": "data.win.eventdata.sourceImage"}},     # Event ID 8, 10
+                    {"exists": {"field": "data.win.eventdata.targetImage"}},     # Event ID 8, 10
+                    {"exists": {"field": "data.win.eventdata.parentImage"}}      # Event ID 1
+                ],
+                "minimum_should_match": 1
+            }
+        }
+    else:
+        # Other entity types: use standard exists filter
+        reverse_field_exists_filter = {"exists": {"field": reverse_field}}
+
     # Build query - aggregate on SOURCE entities (those that point TO our target)
     query = {
         "query": {
             "bool": {
-                "must": [time_filter] + target_filters + additional_filters
+                "must": [time_filter, reverse_field_exists_filter] + target_filters + additional_filters
             }
         },
         "aggs": {
@@ -474,16 +572,60 @@ def _build_reverse_relationship_aggregation_query(
                 }
             },
             "source_entities": {
-                "terms": {
-                    "field": _get_reverse_aggregation_field(source_type),
-                    "size": 100
-                },
+                # For process-to-process inbound: use script to handle targetImage (Event ID 8 victims)
+                "terms": _get_flexible_reverse_aggregation_terms(source_type, target_type),
                 "aggs": entity_aggregations
             }
         }
     }
 
     return query
+
+
+def _get_flexible_reverse_aggregation_terms(source_type: str, target_type: Optional[str]) -> Dict[str, Any]:
+    """
+    Get flexible aggregation terms for reverse (inbound) queries
+
+    For process-to-process inbound queries, we aggregate on the SOURCE of the relationship
+    (the entity pointing TO our target). Event ID 8 uses targetImage field.
+
+    Args:
+        source_type: Source entity type
+        target_type: Target entity type
+
+    Returns:
+        Dict with either standard "field" or script-based "script" aggregation
+    """
+    if source_type.lower() == "process" and target_type and target_type.lower() == "process":
+        # For inbound process queries, aggregate on whatever process field exists
+        # Event ID 8: targetImage (the victim process) appears in our filter
+        # We aggregate on parentImage or image (the sources pointing to our target)
+        return {
+            "script": {
+                "source": """
+                    if (doc.containsKey('data.win.eventdata.parentImage.keyword') &&
+                        doc['data.win.eventdata.parentImage.keyword'].size() > 0) {
+                        return doc['data.win.eventdata.parentImage.keyword'].value;
+                    } else if (doc.containsKey('data.win.eventdata.image.keyword') &&
+                               doc['data.win.eventdata.image.keyword'].size() > 0) {
+                        return doc['data.win.eventdata.image.keyword'].value;
+                    } else if (doc.containsKey('data.win.eventdata.sourceImage.keyword') &&
+                               doc['data.win.eventdata.sourceImage.keyword'].size() > 0) {
+                        return doc['data.win.eventdata.sourceImage.keyword'].value;
+                    } else {
+                        return 'unknown';
+                    }
+                """,
+                "lang": "painless"
+            },
+            "size": 100
+        }
+    else:
+        # Standard field-based aggregation for other entity types
+        return {
+            "field": _get_reverse_aggregation_field(source_type),
+            "size": 100
+        }
 
 
 def _get_reverse_entity_aggregations(source_type: str) -> Dict[str, Any]:
@@ -741,7 +883,7 @@ def _get_entity_filters(entity_type: str, entity_id: Optional[str]) -> List[Dict
                 ]
             }
         })
-    
+
     return filters
 
 
@@ -759,7 +901,7 @@ def _get_entity_field(entity_type: str) -> str:
 def _assess_relationship_risk(connection_strength: int, avg_severity: float, connection_types: List[str]) -> str:
     """Assess risk level of relationship"""
     risk_score = 0
-    
+
     # Factor in connection strength
     if connection_strength > 100:
         risk_score += 30
@@ -767,7 +909,7 @@ def _assess_relationship_risk(connection_strength: int, avg_severity: float, con
         risk_score += 20
     elif connection_strength > 10:
         risk_score += 10
-    
+
     # Factor in average severity
     if avg_severity > 8:
         risk_score += 40
@@ -775,12 +917,12 @@ def _assess_relationship_risk(connection_strength: int, avg_severity: float, con
         risk_score += 25
     elif avg_severity > 3:
         risk_score += 10
-    
+
     # Factor in connection types
     high_risk_types = ["authentication_failed", "privilege_escalation", "malware", "attack"]
     if any(risk_type in " ".join(connection_types).lower() for risk_type in high_risk_types):
         risk_score += 30
-    
+
     if risk_score > 70:
         return "Critical"
     elif risk_score > 40:
@@ -795,14 +937,14 @@ def _analyze_aggregated_relationships(relationships: List[Dict[str, Any]], aggre
     """Analyze relationships using aggregation data"""
     if not relationships:
         return {"message": "No relationships found"}
-    
+
     analysis = {
         "relationship_patterns": {},
         "strength_distribution": {},
         "risk_assessment": {},
         "temporal_analysis": {}
     }
-    
+
     # Analyze relationship strength distribution
     strength_values = [r["connection_strength"] for r in relationships]
     analysis["strength_distribution"] = {
@@ -811,46 +953,46 @@ def _analyze_aggregated_relationships(relationships: List[Dict[str, Any]], aggre
         "avg_strength": sum(strength_values) / len(strength_values),
         "total_connections": sum(strength_values)
     }
-    
+
     # Risk assessment
     risk_counts = {}
     for r in relationships:
         risk_level = r["risk_assessment"]
         risk_counts[risk_level] = risk_counts.get(risk_level, 0) + 1
-    
+
     analysis["risk_assessment"] = {
         "risk_distribution": risk_counts,
         "high_risk_relationships": len([r for r in relationships if r["risk_assessment"] in ["Critical", "High"]]),
         "risk_percentage": (len([r for r in relationships if r["risk_assessment"] in ["Critical", "High"]]) / len(relationships)) * 100
     }
-    
+
     return analysis
 
 
 def _generate_aggregated_recommendations(relationships: List[Dict[str, Any]], analysis: Dict[str, Any]) -> List[str]:
     """Generate recommendations based on aggregated relationship analysis"""
     recommendations = []
-    
+
     if not relationships:
         return ["No entity relationships found in the specified timeframe"]
-    
+
     # High-risk relationship recommendations
     high_risk_count = analysis.get("risk_assessment", {}).get("high_risk_relationships", 0)
     if high_risk_count > 5:
         recommendations.append(f"Critical: {high_risk_count} high-risk relationships detected - immediate investigation required")
     elif high_risk_count > 0:
         recommendations.append(f"Warning: {high_risk_count} high-risk relationships found - review recommended")
-    
+
     # Connection strength recommendations
     max_strength = analysis.get("strength_distribution", {}).get("max_strength", 0)
     if max_strength > 200:
         recommendations.append("Very high connection strength detected - investigate for potential automation or compromise")
-    
+
     # General recommendations
     if len(relationships) > 100:
         recommendations.append("High relationship volume detected - consider narrowing timeframe for detailed analysis")
-    
+
     if not recommendations:
         recommendations.append("Entity relationships appear normal based on aggregated analysis")
-    
+
     return recommendations

@@ -201,21 +201,35 @@ class WazuhOpenSearchClient:
         """
         try:
             from .time_parser import build_single_time_range_filter, build_time_range_filter
+            import re
+
+            # IMPORTANT: Check for ISO date formats FIRST before looking for separators
+            # ISO dates like "2025-08-13" contain "-" but shouldn't be split
+            # Pattern matches: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS
+            if re.match(r'^\d{4}-\d{2}-\d{2}', time_range):
+                # This is an ISO date, not a range - handle as single time expression
+                return build_single_time_range_filter(time_range)
 
             # Handle absolute time ranges (containing separators)
-            if any(sep in time_range.lower() for sep in [" to ", " until ", "-"]):
-                # Parse as start-end range
-                separators = [" to ", " until ", "-"]
-                for sep in separators:
-                    if sep in time_range.lower():
-                        parts = time_range.split(sep)
-                        if len(parts) == 2:
-                            start_time = parts[0].strip()
-                            end_time = parts[1].strip()
-                            return build_time_range_filter(start_time, end_time)
-                        break
+            # NOTE: We check word-based separators first to avoid issues with "-" in dates
+            word_separators = [" to ", " until "]
+            for sep in word_separators:
+                if sep in time_range.lower():
+                    parts = time_range.split(sep, 1)  # Split only on first occurrence
+                    if len(parts) == 2:
+                        start_time = parts[0].strip()
+                        end_time = parts[1].strip()
+                        return build_time_range_filter(start_time, end_time)
 
-            # Handle single time expressions (relative times)
+            # Check for "/" separator (e.g., "08:00/12:00")
+            if "/" in time_range and not re.match(r'^\d{4}-\d{2}-\d{2}', time_range):
+                parts = time_range.split("/")
+                if len(parts) == 2:
+                    start_time = parts[0].strip()
+                    end_time = parts[1].strip()
+                    return build_time_range_filter(start_time, end_time)
+
+            # Handle single time expressions (relative times, single dates, etc.)
             return build_single_time_range_filter(time_range)
 
         except Exception as e:

@@ -2,8 +2,9 @@
 Comprehensive time parsing utilities for all Wazuh functions - System-wide temporal parsing
 """
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Dict, Any
+from dateutil import parser as dateutil_parser
 
 
 def parse_time_to_opensearch(time_str: str) -> str:
@@ -116,13 +117,23 @@ def parse_time_to_opensearch(time_str: str) -> str:
         if match:
             return converter(match)
 
-    # Handle remaining date formats (after natural language processing)
-    if re.match(r'^\d{4}-\d{2}-\d{2}', time_str):
-        return time_str
-
-    # Handle simple date formats
+    # Handle simple date formats (YYYY-MM-DD without time)
     if re.match(r'^\d{4}-\d{2}-\d{2}$', time_str):
         return f"{time_str}T00:00:00"
+
+    # Handle date formats with time already included (YYYY-MM-DD + time)
+    if re.match(r'^\d{4}-\d{2}-\d{2}T', time_str):
+        return time_str
+
+    # Try parsing natural language dates (e.g., "Aug 21 2025", "August 13 2025", "May 15th")
+    try:
+        # Use dateutil to parse natural language dates
+        parsed_date = dateutil_parser.parse(time_str, fuzzy=True)
+        # Return ISO format with time set to start of day
+        return parsed_date.strftime("%Y-%m-%dT%H:%M:%S")
+    except (ValueError, TypeError, AttributeError):
+        # If dateutil can't parse it, continue to fallback
+        pass
 
     # Default fallback with warning
     import structlog
@@ -149,8 +160,29 @@ def build_time_range_filter(start_time: str, end_time: str) -> Dict[str, Any]:
 
 def build_single_time_range_filter(time_range: str) -> Dict[str, Any]:
     """Build single time range filter (e.g., 'past 3 hours') for OpenSearch queries"""
-    parsed_time = parse_time_to_opensearch(time_range)
+    import structlog
+    logger = structlog.get_logger()
 
+    parsed_time = parse_time_to_opensearch(time_range)
+    logger.debug("build_single_time_range_filter", time_range=time_range, parsed_time=parsed_time)
+
+    # If the parsed time is an absolute date (contains year-month-day with time), search the whole day
+    if re.match(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$', parsed_time):
+        # Extract date and create range for entire day
+        # Include milliseconds and UTC timezone marker for precise matching with Wazuh data
+        date_part = parsed_time.split('T')[0]
+        result = {
+            "range": {
+                "@timestamp": {
+                    "gte": f"{date_part}T00:00:00.000Z",
+                    "lte": f"{date_part}T23:59:59.999Z"
+                }
+            }
+        }
+        logger.debug("Matched absolute date pattern", date_part=date_part, result=result)
+        return result
+
+    # For relative times (now-Xh), search from that time to now
     return {
         "range": {
             "@timestamp": {

@@ -92,6 +92,7 @@ async def get_rcf_behavioral_baselines(timeframe: str) -> Dict[str, Any]:
                     host_behavior_values = []
                     file_access_values = []
                     network_behavior_values = []
+                    authentication_behavior_values = []
                     anomaly_grades = []
                     anomaly_scores = []
                     confidence_scores = []
@@ -115,6 +116,8 @@ async def get_rcf_behavioral_baselines(timeframe: str) -> Dict[str, Any]:
                                 file_access_values.append(feature_value)
                             elif feature_name == "network_behavior_patterns":
                                 network_behavior_values.append(feature_value)
+                            elif feature_name == "authentication_behavior_patterns":
+                                authentication_behavior_values.append(feature_value)
                         
                         anomaly_grades.append(source.get("anomaly_grade", 0.0))
                         anomaly_scores.append(source.get("anomaly_score", 0.0))
@@ -155,6 +158,7 @@ async def get_rcf_behavioral_baselines(timeframe: str) -> Dict[str, Any]:
                         "host_behavior_patterns": calculate_behavioral_stats(host_behavior_values, "host_behavior"),
                         "file_access_patterns": calculate_behavioral_stats(file_access_values, "file_access"),
                         "network_behavior_patterns": calculate_behavioral_stats(network_behavior_values, "network_behavior"),
+                        "authentication_behavior_patterns": calculate_behavioral_stats(authentication_behavior_values, "authentication_behavior"),
                         "anomaly_grades": calculate_behavioral_stats(anomaly_grades, "anomaly_grades"),
                         "anomaly_scores": calculate_behavioral_stats(anomaly_scores, "anomaly_scores"),
                         "confidence_scores": calculate_behavioral_stats(confidence_scores, "confidence"),
@@ -247,6 +251,23 @@ async def execute(opensearch_client, params: Dict[str, Any]) -> Dict[str, Any]:
                             "cardinality": {
                                 "field": "data.srcip"
                             }
+                        },
+                        "authentication_behavior_patterns": {
+                            "filter": {
+                                "bool": {
+                                    "should": [
+                                        {"match": {"rule.groups": "authentication"}},
+                                        {"match": {"rule.groups": "authentication_success"}},
+                                        {"match": {"rule.groups": "authentication_failed"}},
+                                        {"match": {"rule.groups": "authentication_failures"}}
+                                    ]
+                                }
+                            },
+                            "aggs": {
+                                "auth_count": {
+                                    "value_count": {"field": "rule.id"}
+                                }
+                            }
                         }
                     }
                 },
@@ -274,6 +295,20 @@ async def execute(opensearch_client, params: Dict[str, Any]) -> Dict[str, Any]:
                         "network_diversity": {
                             "cardinality": {
                                 "field": "data.srcip"
+                            }
+                        },
+                        "authentication_activity": {
+                            "filter": {
+                                "bool": {
+                                    "should": [
+                                        {"match": {"rule.groups": "authentication"}},
+                                        {"match": {"rule.groups": "authentication_success"}},
+                                        {"match": {"rule.groups": "authentication_failed"}}
+                                    ]
+                                }
+                            },
+                            "aggs": {
+                                "auth_count": {"value_count": {"field": "rule.id"}}
                             }
                         },
                         "temporal_activity": {
@@ -308,6 +343,20 @@ async def execute(opensearch_client, params: Dict[str, Any]) -> Dict[str, Any]:
                         "network_activity": {
                             "cardinality": {
                                 "field": "data.srcip"
+                            }
+                        },
+                        "authentication_activity": {
+                            "filter": {
+                                "bool": {
+                                    "should": [
+                                        {"match": {"rule.groups": "authentication"}},
+                                        {"match": {"rule.groups": "authentication_success"}},
+                                        {"match": {"rule.groups": "authentication_failed"}}
+                                    ]
+                                }
+                            },
+                            "aggs": {
+                                "auth_count": {"value_count": {"field": "rule.id"}}
                             }
                         }
                     }
@@ -435,14 +484,18 @@ async def execute(opensearch_client, params: Dict[str, Any]) -> Dict[str, Any]:
             host_behavior = bucket.get("host_behavior_patterns", {}).get("value", 0)
             file_access = bucket.get("file_access_patterns", {}).get("value", 0)
             network_behavior = bucket.get("network_behavior_patterns", {}).get("value", 0)
-            
+
+            # Extract authentication behavior (nested in filter aggregation)
+            auth_behavior = bucket.get("authentication_behavior_patterns", {}).get("auth_count", {}).get("value", 0)
+
             time_series_data.append({
                 "timestamp": timestamp,
                 "user_activity_patterns": user_activity,
                 "process_execution_patterns": process_execution,
                 "host_behavior_patterns": host_behavior,
                 "file_access_patterns": file_access,
-                "network_behavior_patterns": network_behavior
+                "network_behavior_patterns": network_behavior,
+                "authentication_behavior_patterns": auth_behavior
             })
             
             # Compare against RCF baselines for each behavioral feature
@@ -452,7 +505,8 @@ async def execute(opensearch_client, params: Dict[str, Any]) -> Dict[str, Any]:
                     "process_execution_patterns": process_execution,
                     "host_behavior_patterns": host_behavior,
                     "file_access_patterns": file_access,
-                    "network_behavior_patterns": network_behavior
+                    "network_behavior_patterns": network_behavior,
+                    "authentication_behavior_patterns": auth_behavior
                 }
                 
                 for feature_name, current_value in behavioral_features.items():
@@ -516,7 +570,8 @@ async def execute(opensearch_client, params: Dict[str, Any]) -> Dict[str, Any]:
             process_diversity = bucket.get("process_execution_diversity", {}).get("value", 0)
             file_access_count = bucket.get("file_access_count", {}).get("value", 0)
             network_diversity = bucket.get("network_diversity", {}).get("value", 0)
-            
+            auth_activity = bucket.get("authentication_activity", {}).get("auth_count", {}).get("value", 0)
+
             behavioral_changes = []
             anomaly_score = 0
             
@@ -578,18 +633,35 @@ async def execute(opensearch_client, params: Dict[str, Any]) -> Dict[str, Any]:
                     baseline_data = rcf_behavioral_baselines["network_behavior_patterns"]
                     baseline_mean = baseline_data.get("current_baseline", 0)
                     threshold = baseline_data.get("behavioral_threshold", baseline_mean)
-                    
+
                     # Apply sensitivity adjustment only if needed
                     if multiplier != 1.0:
                         threshold *= multiplier
-                    
+
                     if network_diversity > threshold:
                         deviation_ratio = network_diversity / baseline_mean if baseline_mean > 0 else network_diversity
                         behavioral_changes.append(f"Network behavior anomaly: {deviation_ratio:.1f}x RCF baseline")
                         # Use RCF confidence to adjust anomaly score increment
                         score_increment = max(30, int(40 * (1 - rcf_confidence + 0.5)))
                         anomaly_score += score_increment
-            
+
+                # Authentication behavior pattern analysis
+                if "authentication_behavior_patterns" in rcf_behavioral_baselines and auth_activity > 0:
+                    baseline_data = rcf_behavioral_baselines["authentication_behavior_patterns"]
+                    baseline_mean = baseline_data.get("current_baseline", 0)
+                    threshold = baseline_data.get("behavioral_threshold", baseline_mean)
+
+                    # Apply sensitivity adjustment only if needed
+                    if multiplier != 1.0:
+                        threshold *= multiplier
+
+                    if auth_activity > threshold:
+                        deviation_ratio = auth_activity / baseline_mean if baseline_mean > 0 else auth_activity
+                        behavioral_changes.append(f"Authentication behavior anomaly: {deviation_ratio:.1f}x RCF baseline")
+                        # Use RCF confidence to adjust anomaly score increment
+                        score_increment = max(30, int(40 * (1 - rcf_confidence + 0.5)))
+                        anomaly_score += score_increment
+
             if behavioral_changes:
                 # Use RCF-derived risk thresholds based on anomaly grades
                 medium_threshold = max(40, int(50 * (1 - rcf_anomaly_grade_mean + 0.5))) if rcf_behavioral_baselines else 50
@@ -604,6 +676,7 @@ async def execute(opensearch_client, params: Dict[str, Any]) -> Dict[str, Any]:
                     "process_diversity": process_diversity,
                     "file_access_count": file_access_count,
                     "network_diversity": network_diversity,
+                    "authentication_activity": auth_activity,
                     "anomaly_score": min(100, anomaly_score),
                     "risk_level": "Critical" if anomaly_score > critical_threshold else "High" if anomaly_score > medium_threshold else "Medium",
                     "behavioral_changes": behavioral_changes,
@@ -629,7 +702,8 @@ async def execute(opensearch_client, params: Dict[str, Any]) -> Dict[str, Any]:
             process_diversity = bucket.get("process_diversity", {}).get("value", 0)
             file_access_activity = bucket.get("file_access_activity", {}).get("value", 0)
             network_activity = bucket.get("network_activity", {}).get("value", 0)
-            
+            auth_activity = bucket.get("authentication_activity", {}).get("auth_count", {}).get("value", 0)
+
             behavioral_changes = []
             anomaly_score = 0
             
@@ -679,7 +753,15 @@ async def execute(opensearch_client, params: Dict[str, Any]) -> Dict[str, Any]:
                     # Use RCF confidence to adjust anomaly score increment
                     score_increment = max(32, int(45 * (1 - rcf_confidence + 0.5)))
                     anomaly_score += score_increment
-            
+
+                # Authentication activity analysis
+                if auth_activity > behavioral_threshold:
+                    deviation_ratio = auth_activity / baseline_mean if baseline_mean > 0 else auth_activity
+                    behavioral_changes.append(f"Authentication activity anomaly: {deviation_ratio:.1f}x RCF baseline")
+                    # Use RCF confidence to adjust anomaly score increment
+                    score_increment = max(30, int(40 * (1 - rcf_confidence + 0.5)))
+                    anomaly_score += score_increment
+
             if behavioral_changes:
                 # Use RCF-derived risk thresholds based on anomaly grades
                 medium_threshold = max(40, int(50 * (1 - rcf_anomaly_grade_mean + 0.5))) if rcf_behavioral_baselines else 50
@@ -694,6 +776,7 @@ async def execute(opensearch_client, params: Dict[str, Any]) -> Dict[str, Any]:
                     "process_diversity": process_diversity,
                     "file_access_activity": file_access_activity,
                     "network_activity": network_activity,
+                    "authentication_activity": auth_activity,
                     "anomaly_score": min(100, anomaly_score),
                     "risk_level": "Critical" if anomaly_score > critical_threshold else "High" if anomaly_score > medium_threshold else "Medium",
                     "behavioral_changes": behavioral_changes,

@@ -1,11 +1,13 @@
 """
 Wazuh Security Agent using LangChain
 """
-from langchain.agents import initialize_agent, AgentType
+from langchain.agents import AgentExecutor
+from langchain.agents.structured_chat.base import create_structured_chat_agent
 from langchain.memory import ConversationBufferWindowMemory
 from langchain.callbacks import LangChainTracer
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from typing import Dict, Any, List, Optional
 import structlog
 import os
@@ -90,16 +92,6 @@ class WazuhSecurityAgent:
         # Initialize context processor
         self.context_processor = ConversationContextProcessor()
         
-        # Initialize callbacks
-        callbacks = []
-        # Only enable LangSmith tracing if properly configured
-        try:
-            if os.getenv("LANGCHAIN_TRACING_V2") == "true" and os.getenv("LANGCHAIN_API_KEY"):
-                callbacks.append(LangChainTracer())
-                logger.info("LangSmith tracing enabled")
-        except Exception as e:
-            logger.warning("Failed to initialize LangSmith tracing", error=str(e))
-        
         # Enhanced system prompt with context preservation instructions
         self.system_prompt = """You are a Wazuh SIEM security analyst assistant. You help users investigate security incidents, analyze alerts, and understand their security posture.
 
@@ -157,21 +149,78 @@ When presenting anomaly detection results, you MUST explicitly state threshold s
 
 Technical note: When context hints from previous input query like "these alerts", "this host", "this command, these processes", etc appear, consider using previous input parameters to maintain query continuity."""
 
-        # Initialize agent with system prompt
-        self.agent = initialize_agent(
-            tools=self.tools,
+        # Initialize callbacks
+        callbacks = []
+        # Only enable LangSmith tracing if properly configured
+        try:
+            if os.getenv("LANGCHAIN_TRACING_V2") == "true" and os.getenv("LANGCHAIN_API_KEY"):
+                callbacks.append(LangChainTracer())
+                logger.info("LangSmith tracing enabled")
+        except Exception as e:
+            logger.warning("Failed to initialize LangSmith tracing", error=str(e))
+
+        # Create prompt template for structured chat agent
+        # The system prompt needs to include tool information
+        system_message = f"""{self.system_prompt}
+
+You have access to the following tools:
+
+{{tools}}
+
+Use a json blob to specify a tool by providing an action key (tool name) and an action_input key (tool input).
+
+Valid "action" values: "Final Answer" or {{tool_names}}
+
+Provide only ONE action per $JSON_BLOB, as shown:
+
+```
+{{{{
+  "action": $TOOL_NAME,
+  "action_input": $INPUT
+}}}}
+```
+
+Follow this format:
+
+Question: input question to answer
+Thought: consider previous and subsequent steps
+Action:
+```
+$JSON_BLOB
+```
+Observation: action result
+... (repeat Thought/Action/Observation N times)
+Thought: I know what to respond
+Action:
+```
+{{{{
+  "action": "Final Answer",
+  "action_input": "Final response to human"
+}}}}
+```"""
+
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_message),
+            MessagesPlaceholder(variable_name="chat_history", optional=True),
+            ("human", "{input}\n\n{agent_scratchpad}"),
+        ])
+
+        # Create the structured chat agent
+        agent = create_structured_chat_agent(
             llm=self.llm,
-            agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
+            tools=self.tools,
+            prompt=prompt
+        )
+
+        # Create agent executor
+        self.agent = AgentExecutor(
+            agent=agent,
+            tools=self.tools,
             memory=self.memory,
             verbose=True,
-            max_iterations=15,
-            early_stopping_method="generate",  # Generate response instead of force stopping
             callbacks=callbacks,
             handle_parsing_errors=True,
-            agent_kwargs={
-                "system_message": self.system_prompt,
-                "prefix": self.system_prompt
-            }
+            max_iterations=15
         )
         
         logger.info("Wazuh Security Agent initialized",
@@ -210,20 +259,68 @@ Technical note: When context hints from previous input query like "these alerts"
             except Exception as e:
                 logger.warning("Failed to initialize LangSmith tracing", error=str(e))
 
-            self.agent = initialize_agent(
-                tools=self.tools,
+            # Create prompt template for structured chat agent
+            # The system prompt needs to include tool information
+            system_message = f"""{self.system_prompt}
+
+You have access to the following tools:
+
+{{tools}}
+
+Use a json blob to specify a tool by providing an action key (tool name) and an action_input key (tool input).
+
+Valid "action" values: "Final Answer" or {{tool_names}}
+
+Provide only ONE action per $JSON_BLOB, as shown:
+
+```
+{{{{
+  "action": $TOOL_NAME,
+  "action_input": $INPUT
+}}}}
+```
+
+Follow this format:
+
+Question: input question to answer
+Thought: consider previous and subsequent steps
+Action:
+```
+$JSON_BLOB
+```
+Observation: action result
+... (repeat Thought/Action/Observation N times)
+Thought: I know what to respond
+Action:
+```
+{{{{
+  "action": "Final Answer",
+  "action_input": "Final response to human"
+}}}}
+```"""
+
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", system_message),
+                MessagesPlaceholder(variable_name="chat_history", optional=True),
+                ("human", "{input}\n\n{agent_scratchpad}"),
+            ])
+
+            # Create the structured chat agent
+            agent = create_structured_chat_agent(
                 llm=self.llm,
-                agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
+                tools=self.tools,
+                prompt=prompt
+            )
+
+            # Create agent executor with session-specific memory
+            self.agent = AgentExecutor(
+                agent=agent,
+                tools=self.tools,
                 memory=session_memory,
                 verbose=True,
-                max_iterations=15,
-                early_stopping_method="generate",  # Match main agent initialization
                 callbacks=callbacks,
                 handle_parsing_errors=True,
-                agent_kwargs={
-                    "system_message": self.system_prompt,
-                    "prefix": self.system_prompt
-                }
+                max_iterations=15
             )
 
             logger.info("Agent memory updated for session", session_id=session_id)
@@ -459,7 +556,7 @@ Technical note: When context hints from previous input query like "these alerts"
         """
         # Determine model info
         if self.model_type == "local":
-            model_name = os.getenv("LOCAL_MODEL_NAME", "mistral-large:123b-instruct-2407-q4_0")
+            model_name = os.getenv("LOCAL_MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct-AWQ")
             model_info = f"Local Model: {model_name}"
         else:
             model_info = "claude-sonnet-4-20250514"

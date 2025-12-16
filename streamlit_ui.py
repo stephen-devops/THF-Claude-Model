@@ -97,7 +97,9 @@ if 'context_info' not in st.session_state:
     st.session_state.context_info = {}
 
 # Configuration
-API_BASE_URL = "http://localhost:8000"
+# For Docker: use port 8030 (host mapping), for local dev: use port 8000
+API_PORT = os.getenv("API_PORT", "8000")  # Default to 8000 for local development
+API_BASE_URL = f"http://localhost:{API_PORT}"
 
 def check_api_health():
     """Check if the API is running"""

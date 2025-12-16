@@ -5,14 +5,14 @@ from typing import Dict, Any, Optional
 
 # Sysmon Event ID to relationship type mappings
 SYSMON_EVENT_RELATIONSHIPS = {
-    "1": "spawned",           # Process Create
+    "1": "creates",           # Process Create (process creates another process)
     "2": "modified",          # File Creation Time Changed
     "3": "connected_to",      # Network Connection
-    "5": "terminated",        # Process Terminated
+    "5": "terminates",        # Process Terminated (self-termination - no actor)
     "6": "loaded",            # Driver Loaded
     "7": "loaded",            # Image/DLL Loaded
-    "8": "accessed",          # CreateRemoteThread
-    "10": "accessed",         # Process Access
+    "8": "accesses",          # CreateRemoteThread (Process Injection - simplified to accesses)
+    "10": "accesses",         # Process Access (will be refined by grantedAccess field)
     "11": "creates",          # File Create
     "12": "creates",          # Registry Create/Delete
     "13": "writes",           # Registry Set Value
@@ -30,14 +30,14 @@ WINDOWS_EVENT_RELATIONSHIPS = {
     "4625": "failed_auth_as",     # Logon Failed
     "4648": "authenticated_as",   # Logon with Explicit Credentials
     "4672": "elevated_to",        # Special Privileges Assigned
-    "4688": "spawned",            # Process Creation
-    "4689": "terminated",         # Process Termination
+    "4688": "creates",            # Process Creation (process creates another process)
+    "4689": "terminates",         # Process Termination (self-termination - no actor)
     "4698": "created",            # Scheduled Task Created
     "4699": "deleted",            # Scheduled Task Deleted
     "4720": "created",            # User Account Created
     "4726": "deleted",            # User Account Deleted
-    "5140": "accessed",           # Network Share Access
-    "5145": "accessed",           # Network Share Detailed Access
+    "5140": "accesses",           # Network Share Access
+    "5145": "accesses",           # Network Share Detailed Access
     "5156": "connected_to",       # Network Connection Allowed
     "5157": "blocked_connection_to", # Network Connection Blocked
 }
@@ -45,10 +45,10 @@ WINDOWS_EVENT_RELATIONSHIPS = {
 # Reverse relationship mappings (for bidirectional queries)
 # Maps forward relationships to their reverse equivalents
 REVERSE_RELATIONSHIP_MAPPING = {
-    # Process relationships - forward vs reverse
-    "spawned": "spawned_by",           # Process created another → Process created by another
-    "terminated": "terminated_by",     # Process killed another → Process killed by another
-    "injected_into": "injected_by",    # Process injected into another → Process injected by another
+    # Process relationships - forward vs reverse (SIMPLIFIED TO 3 TYPES)
+    "creates": "created_by",           # Process created another → Process created by another
+    "terminates": "terminated_by",     # Process terminated another → Process terminated by another
+    "accesses": "accessed_by",         # Process accessed another → Process accessed by another
 
     # File operation relationships - forward vs reverse
     "creates": "created_by",           # Process creates file → File created by process
@@ -135,13 +135,13 @@ def _validate_relationship_for_pair(
     # Define which relationships are valid for which (source, target) pairs
     # Format: relationship: [(source, target), ...]
     valid_mappings = {
-        # Process → Process relationships
-        "spawned": [("process", "process")],
-        "spawned_by": [("process", "process")],
-        "terminated": [("process", "process")],
+        # Process → Process relationships (SIMPLIFIED TO 3 TYPES)
+        "creates": [("process", "process")],
+        "created_by": [("process", "process")],
+        "terminates": [("process", "process")],
         "terminated_by": [("process", "process")],
-        "injected_into": [("process", "process")],
-        "injected_by": [("process", "process")],
+        "accesses": [("process", "process"), ("process", "file"), ("user", "file")],
+        "accessed_by": [("process", "process"), ("file", "process"), ("file", "user")],
         "interacts_with": [("process", "process")],
 
         # Process → File relationships
@@ -199,7 +199,7 @@ def _validate_relationship_for_pair(
         "owned_by": [("file", "user")],
 
         # Generic relationships (multiple valid pairs)
-        "accessed": [("process", "file"), ("user", "file"), ("user", "host"), ("process", "host")],
+        "accessed": [("process", "file"), ("user", "file"), ("user", "host"), ("process", "host"), ("process", "process")],
         "connected_to": [("process", "host"), ("process", "process"), ("user", "host"), ("file", "host")],
         "blocked_connection_to": [("process", "host")],
         "queried": [("process", "host")],
@@ -216,6 +216,51 @@ def _validate_relationship_for_pair(
 
     # Check if (source, target) pair is in the list of valid pairs
     return (source, target) in valid_pairs
+
+
+def _parse_granted_access_for_event_id_10(event_data: Dict[str, Any]) -> Optional[str]:
+    """
+    Parse grantedAccess field for Sysmon Event ID 10 (ProcessAccess)
+    to distinguish between "terminates" and generic "accesses"
+
+    SIMPLIFIED: Only checks for PROCESS_TERMINATE (0x0001) bit
+    - If TERMINATE bit is set → "terminates"
+    - Otherwise → None (falls back to generic "accesses")
+
+    Args:
+        event_data: Wazuh alert event data
+
+    Returns:
+        "terminates" if PROCESS_TERMINATE access, None for generic "accesses"
+    """
+    win_eventdata = event_data.get("data", {}).get("win", {}).get("eventdata", {})
+    granted_access = win_eventdata.get("grantedAccess", "")
+
+    if not granted_access:
+        return None
+
+    try:
+        # Parse hex value (e.g., "0x1400" or "1400")
+        if granted_access.startswith("0x") or granted_access.startswith("0X"):
+            access_int = int(granted_access, 16)
+        else:
+            # Try parsing as hex without 0x prefix
+            try:
+                access_int = int(granted_access, 16)
+            except ValueError:
+                # If that fails, try decimal
+                access_int = int(granted_access)
+
+        # SIMPLIFIED: Only check for PROCESS_TERMINATE (0x0001)
+        if access_int & 0x0001:
+            return "terminates"
+
+        # For all other access types → None (falls back to generic "accesses")
+        return None
+
+    except (ValueError, TypeError):
+        # If we can't parse the access value, return None (fall back to generic "accesses")
+        return None
 
 
 def infer_relationship_type(
@@ -241,7 +286,16 @@ def infer_relationship_type(
     rule_description = event_data.get("rule", {}).get("description", "").lower()
 
     # Priority 1: Check Sysmon Event ID first (most specific)
-    # BUT: Verify the relationship makes sense for the (source, target) pair
+    # SPECIAL CASE: Event ID 10 (ProcessAccess) - check grantedAccess field for specific relationship
+    if event_id == "10" and source_type.lower() == "process" and target_type.lower() == "process":
+        specific_relationship = _parse_granted_access_for_event_id_10(event_data)
+        if specific_relationship:
+            # Validate the specific relationship is valid for process-to-process
+            if _validate_relationship_for_pair(specific_relationship, source_type, target_type):
+                return specific_relationship
+        # If no specific relationship found, fall through to default "accessed"
+
+    # Continue with normal Event ID mapping
     if event_id and event_id in SYSMON_EVENT_RELATIONSHIPS:
         relationship = SYSMON_EVENT_RELATIONSHIPS[event_id]
 
@@ -314,13 +368,13 @@ def _infer_from_keywords(
     elif any(kw in rule_description for kw in ["process created", "new process", "spawned", "launched"]):
         # Only Process → Process or User → Process makes sense
         if source_type.lower() == "process" and target_type.lower() == "process":
-            return "spawned"
+            return "creates"  # SIMPLIFIED: spawned → creates
         elif source_type.lower() == "user" and target_type.lower() == "process":
             return "launched"
         return None
     elif any(kw in rule_description for kw in ["process terminated", "killed", "ended"]):
         if source_type.lower() == "process" and target_type.lower() == "process":
-            return "terminated"
+            return "terminates"  # SIMPLIFIED: terminated → terminates
         return None
     elif "executed" in rule_description or "execution" in rule_description:
         # Process executed by user, or host executes process
@@ -405,14 +459,14 @@ def _infer_by_entity_types(
         else:
             return "executed_by"
 
-    # Process → Process
+    # Process → Process (SIMPLIFIED TO 3 TYPES: creates, accesses, terminates)
     elif source == "process" and target == "process":
         if "inject" in rule_description or "remote" in rule_description:
-            return "injected_into"
+            return "accesses"  # SIMPLIFIED: injected_into → accesses
         elif "terminate" in rule_description or "kill" in rule_description:
-            return "terminated"
+            return "terminates"  # SIMPLIFIED: terminated → terminates
         else:
-            return "spawned"
+            return "creates"  # SIMPLIFIED: spawned → creates
 
     # Process → File
     elif source == "process" and target == "file":
@@ -499,24 +553,24 @@ def get_relationship_description(relationship_type: str) -> str:
         Human-readable description
     """
     descriptions = {
-        # Forward Process relationships
+        # Forward Process → Process relationships (SIMPLIFIED TO 3 TYPES)
+        "creates": "Process created another process",
+        "terminates": "Process terminated another process",
+        "accesses": "Process accessed another process",
+
+        # Reverse Process → Process relationships
+        "created_by": "Process created by another process",
+        "terminated_by": "Process terminated by another process",
+        "accessed_by": "Process accessed by another process",
+
+        # Process → Other entities
         "runs_on": "Process executes on host",
         "executed_by": "Process executed by user",
-        "spawned": "Process created another process",
-        "terminated": "Process terminated another process",
-        "injected_into": "Process injected code into another process",
-        "creates": "Process created file",
         "deletes": "Process deleted file",
         "writes": "Process wrote to file",
         "reads": "Process read from file",
         "modifies": "Process modified file",
         "loads": "Process loaded library/module",
-        "accesses": "Process accessed file",
-
-        # Reverse Process relationships (bidirectional support)
-        "spawned_by": "Process created by another process",
-        "terminated_by": "Process terminated by another process",
-        "injected_by": "Process injected by another process",
         "created_by": "File created by process",
         "deleted_by": "File deleted by process",
         "written_by": "File written by process",

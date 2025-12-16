@@ -300,6 +300,8 @@ KEY PATTERNS BY ENTITY TYPE:
 PROCESS queries:
 - 'what processes did X spawn?' → source_type='process', source_id='X', target_type='process'
 - 'what files did X create/modify?' → source_type='process', source_id='X', target_type='file'
+- 'what processes did X inject into?' → source_type='process', source_id='X', target_type='process' (Event ID 8)
+- 'what processes did X access?' → source_type='process', source_id='X', target_type='process' (Event ID 10)
 - 'who ran/executed process X?' → source_type='process', source_id='X', target_type='user'
 - 'where is X running?' → source_type='process', source_id='X', target_type='host'
 
@@ -320,6 +322,8 @@ FILE queries:
 BULK queries (omit source_id for all entities):
 - 'all processes by users' → source_type='user', target_type='process'
 - 'all files by processes' → source_type='process', target_type='file'
+- 'all process injections' → source_type='process', target_type='process' (Event ID 8)
+- 'all process access events' → source_type='process', target_type='process' (Event ID 10)
 
 ALL RELATIONSHIPS (omit target_type):
 - 'all relationships for X' → source_type='process/user/host/file', source_id='X'
@@ -328,7 +332,7 @@ FILTERS (ONLY when explicitly mentioned):
 - host filter: 'files created by X on host Y' → source_type='process', source_id='X', target_type='file', host='Y'
 - user filter: 'processes on host X by user Y' → source_type='host', source_id='X', target_type='process', user='Y'
 
-RELATIONSHIP TYPES: spawned/spawned_by, created/created_by, modified/modified_by, executed/executed_by, logged_into, owns/owned_by, contains/stored_on, runs_on/hosts
+RELATIONSHIP TYPES: spawned/spawned_by, created/created_by, modified/modified_by, executed/executed_by, logged_into, owns/owned_by, contains/stored_on, runs_on/hosts, injected_into/injected_by, accessed/accessed_by, deleted/deleted_by, terminated/terminated_by
 
 BIDIRECTIONAL: Returns both outbound (source→target) and inbound (target→source) relationships by default.
 
@@ -397,7 +401,7 @@ NOT FOR: Timelines ('when did X happen?') → use trace_timeline. Entity propert
             if rel_lower in ["entity_to_entity", "entity", "direct"]:
                 from functions.map_relationships.entity_to_entity import execute
                 result = await execute(self.opensearch_client, params)
-                
+
             elif rel_lower in ["behavioral_correlation", "behavioural_correlation", "access_patterns", "access", "patterns", "behavior", "behaviour", "activity_correlation", "correlation", "activity", "activities"]:
                 from functions.map_relationships.behavioural_correlation import execute
                 result = await execute(self.opensearch_client, params)
@@ -569,7 +573,7 @@ class FindAnomaliesTool(WazuhBaseTool):
                 from functions.find_anomalies.detect_behavioral import execute
                 result = await execute(self.opensearch_client, params)
                 
-            elif anomaly_type_lower in ["trend_analysis", "trends", "trending", "time_trend", "temporal_trend"]:
+            elif anomaly_type_lower in ["trend", "trend_analysis", "trends", "trending", "time_trend", "temporal_trend"]:
                 from functions.find_anomalies.detect_trend import execute
                 result = await execute(self.opensearch_client, params)
                 
