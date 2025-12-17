@@ -1,8 +1,9 @@
 # Core LLM and Agent Framework
-langchain>=0.3.26
+langchain==0.3.27
 langsmith>=0.4.5
 anthropic>=0.57.1
-langchain-anthropic>=0.3.17
+langchain-anthropic==0.3.17
+langchain-core==0.3.76
 
 # OpenSearch Integration
 opensearch-py>=2.4.0
