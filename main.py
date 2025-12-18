@@ -64,6 +64,7 @@ class QueryResponse(BaseModel):
     response: str
     session_id: str
     status: str = "success"
+    timing: Optional[dict] = None
 
 class ErrorResponse(BaseModel):
     """Error response model"""
@@ -109,21 +110,27 @@ async def query_agent(request: QueryRequest):
         raise HTTPException(status_code=503, detail="Agent not initialized")
     
     try:
-        logger.info("Processing query", 
+        logger.info("Processing query",
                    query=request.query[:100],  # Log first 100 chars
                    session_id=request.session_id)
-        
+
         # Process query with agent including session context
-        response = await agent.query(request.query, request.session_id)
-        
-        logger.info("Query processed successfully", 
+        result = await agent.query(request.query, request.session_id)
+
+        # Extract response and timing from result dict
+        response_text = result.get("response", "")
+        timing_data = result.get("timing", {})
+
+        logger.info("Query processed successfully",
                    session_id=request.session_id,
-                   response_length=len(response))
-        
+                   response_length=len(response_text),
+                   total_time=timing_data.get("total_duration", 0))
+
         return QueryResponse(
-            response=response,
+            response=response_text,
             session_id=request.session_id,
-            status="success"
+            status="success",
+            timing=timing_data
         )
         
     except Exception as e:

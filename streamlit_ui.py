@@ -284,11 +284,17 @@ if query and query.strip() and query != st.session_state.last_query:
         "timestamp": datetime.now().strftime("%H:%M:%S")
     })
 
+    # Measure frontend-to-frontend time
+    frontend_start = time.time()
+
     # Show loading spinner
     with st.spinner("🤔 Analyzing your security question. This may take a few minutes ..."):
         response = send_query(query, st.session_state.session_id)
 
-    # Add assistant response to history
+    frontend_end = time.time()
+    frontend_total = frontend_end - frontend_start
+
+    # Add assistant response to history with timing
     if "error" in response:
         st.session_state.messages.append({
             "role": "error",
@@ -297,10 +303,15 @@ if query and query.strip() and query != st.session_state.last_query:
             "timestamp": datetime.now().strftime("%H:%M:%S")
         })
     else:
+        # Extract timing data from response
+        timing_data = response.get("timing", {})
+        timing_data["frontend_total"] = frontend_total
+
         st.session_state.messages.append({
             "role": "assistant",
             "content": response["response"],
-            "timestamp": datetime.now().strftime("%H:%M:%S")
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+            "timing": timing_data
         })
 
     # Rerun to update the interface
@@ -332,6 +343,39 @@ if st.session_state.messages:
                             st.text(message["details"])
                 else:
                     st.markdown(f'<div class="response-container">{message["content"]}</div>', unsafe_allow_html=True)
+
+                    # Display timing information if available (for assistant messages)
+                    if message["role"] == "assistant" and "timing" in message:
+                        timing = message["timing"]
+                        total_time = timing.get("total_duration", 0)
+                        llm_time = timing.get("total_llm_time", 0)
+                        tool_time = timing.get("total_tool_time", 0)
+                        frontend_total = timing.get("frontend_total", 0)
+                        iterations = timing.get("iterations", 0)
+
+                        with st.expander("⏱️ Timing Information"):
+                            col_a, col_b = st.columns(2)
+
+                            with col_a:
+                                st.metric("Frontend Total", f"{frontend_total:.2f}s")
+                                st.metric("Backend Total", f"{total_time:.2f}s")
+                                st.metric("Iterations", iterations)
+
+                            with col_b:
+                                st.metric("LLM Time", f"{llm_time:.2f}s", f"{llm_time/total_time*100:.1f}%" if total_time > 0 else "0%")
+                                st.metric("Tool Time", f"{tool_time:.2f}s", f"{tool_time/total_time*100:.1f}%" if total_time > 0 else "0%")
+
+                            # Show detailed timing breakdown if available
+                            if timing.get("llm_calls"):
+                                with st.expander("LLM Calls Detail"):
+                                    for idx, call in enumerate(timing["llm_calls"], 1):
+                                        st.text(f"Call {idx}: {call['duration']:.2f}s")
+
+                            if timing.get("tool_calls"):
+                                with st.expander("Tool Calls Detail"):
+                                    for idx, call in enumerate(timing["tool_calls"], 1):
+                                        tool_name = call.get('tool_name', call.get('name', 'unknown'))
+                                        st.text(f"{tool_name}: {call['duration']:.2f}s")
 
             st.markdown("---")
 

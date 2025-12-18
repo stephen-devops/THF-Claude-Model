@@ -17,6 +17,7 @@ from collections import defaultdict
 from functions._shared.opensearch_client import WazuhOpenSearchClient
 from tools.wazuh_tools import get_all_tools
 from .context_processor import ConversationContextProcessor
+from .timing_callback import TimingCallbackHandler
 
 logger = structlog.get_logger()
 
@@ -325,7 +326,7 @@ Action:
 
             logger.info("Agent memory updated for session", session_id=session_id)
 
-    async def query(self, user_input: str, session_id: str = "default") -> str:
+    async def query(self, user_input: str, session_id: str = "default") -> Dict[str, Any]:
         """
         Process user query and return response with session-based context
 
@@ -334,8 +335,12 @@ Action:
             session_id: Unique session identifier for conversation context
 
         Returns:
-            Agent's response
+            Dict with 'response' and 'timing' keys
         """
+        # Initialize timing callback
+        timing_callback = TimingCallbackHandler()
+        timing_callback.start_timing()
+
         try:
             # Update agent memory for this session
             self._update_agent_memory(session_id)
@@ -359,24 +364,37 @@ Action:
             if context_result["context_applied"]:
                 enriched_input = self._create_context_enriched_input(user_input, context_result)
 
-            # Execute agent with context-aware input
-            response = await self._execute_with_retry(enriched_input, context_result)
+            # Execute agent with context-aware input and timing callback
+            response = await self._execute_with_retry(enriched_input, context_result, timing_callback=timing_callback)
+
+            # End timing and get summary
+            timing_callback.end_timing()
+            timing_summary = timing_callback.get_summary()
 
             logger.info("Agent query completed with context",
                        query_preview=user_input[:100],
                        session_id=session_id,
-                       response_length=len(response))
+                       response_length=len(response),
+                       total_time=timing_summary.get("total_duration", 0))
 
-            return response
+            return {
+                "response": response,
+                "timing": timing_summary
+            }
 
         except Exception as e:
+            timing_callback.end_timing()
             logger.error("Agent query failed",
                         error=str(e),
                         query_preview=user_input[:100],
                         session_id=session_id)
-            return f"I encountered an error processing your request: {str(e)}"
+            return {
+                "response": f"I encountered an error processing your request: {str(e)}",
+                "timing": timing_callback.get_summary()
+            }
 
-    async def _execute_with_retry(self, user_input: str, context_result: Dict[str, Any], max_retries: int = 2) -> str:
+    async def _execute_with_retry(self, user_input: str, context_result: Dict[str, Any],
+                                   timing_callback: TimingCallbackHandler = None, max_retries: int = 2) -> str:
         """Execute agent with retry logic for API overload"""
         # Store context result for tool execution
         self._current_context_result = context_result
@@ -384,7 +402,13 @@ Action:
         for attempt in range(max_retries + 1):
             try:
                 # Agent expects input as dict with "input" key for STRUCTURED_CHAT type
-                response = await self.agent.ainvoke({"input": user_input})
+                if timing_callback:
+                    response = await self.agent.ainvoke(
+                        {"input": user_input},
+                        config={"callbacks": [timing_callback]}
+                    )
+                else:
+                    response = await self.agent.ainvoke({"input": user_input})
                 # Extract the output from the response dict
                 return response.get("output", str(response))
             except Exception as e:
